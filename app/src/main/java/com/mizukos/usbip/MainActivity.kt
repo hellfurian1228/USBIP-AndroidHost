@@ -1,6 +1,10 @@
 package com.mizukos.usbip
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.hardware.usb.UsbConstants
+import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -9,6 +13,11 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.*
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
@@ -29,17 +38,48 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var tvServerIp: TextView
     private lateinit var tvServiceStatus: TextView
+    private lateinit var tvLogStatus: TextView
     private lateinit var rvDevices: RecyclerView
     private lateinit var tvEmptyState: TextView
     private lateinit var btnRefresh: ImageButton
 
+    // Cache for UVC devices waiting for Camera Permission grant
+    private var pendingDeviceToConnect: UsbDevice? = null
+
+    // Modern Android 10+ Camera Permission Launcher
+    private val cameraPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { isGranted ->
+        if (isGranted) {
+            pendingDeviceToConnect?.let { device ->
+                ErrorLogger.log("Camera permission granted. Proceeding with ${device.productName}")
+                viewModel.connectDevice(device)
+            }
+        } else {
+            ErrorLogger.log("Camera permission DENIED. Cannot tunnel UVC device.")
+            Toast.makeText(
+                this,
+                "Camera permission is required by Android to tunnel USB Scanners and Webcams.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        pendingDeviceToConnect = null
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         
         // Keep screen on while app is in foreground
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         
         setContentView(R.layout.activity_main)
+
+        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main_root)) { v, insets ->
+            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            v.setPadding(v.paddingLeft, systemBars.top, v.paddingRight, systemBars.bottom)
+            insets
+        }
 
         // Global error catching
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
@@ -52,6 +92,10 @@ class MainActivity : ComponentActivity() {
         setupViewModel()
         setupRecyclerView()
         observeState()
+
+        ErrorLogger.onLogCallback = { msg ->
+            viewModel.updateStatus(msg)
+        }
 
         lifecycleScope.launch(Dispatchers.IO) {
             val appCtx = applicationContext
@@ -67,6 +111,7 @@ class MainActivity : ComponentActivity() {
     private fun initViews() {
         tvServerIp = findViewById(R.id.tv_server_ip)
         tvServiceStatus = findViewById(R.id.tv_service_status)
+        tvLogStatus = findViewById(R.id.tv_log_status)
         rvDevices = findViewById(R.id.rv_devices)
         tvEmptyState = findViewById(R.id.tv_empty_state)
         val btnCopyLogs: Button = findViewById(R.id.btn_copy_logs)
@@ -83,7 +128,9 @@ class MainActivity : ComponentActivity() {
 
     private fun setupViewModel() {
         usbManager = getSystemService(USB_SERVICE) as UsbManager
-        viewModel = ViewModelProvider(this, object : ViewModelProvider.Factory {
+        viewModel = ViewModelProvider(
+            this,
+            object : ViewModelProvider.Factory {
             override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
                 @Suppress("UNCHECKED_CAST")
                 return UsbDeviceViewModel(usbManager) as T
@@ -93,11 +140,51 @@ class MainActivity : ComponentActivity() {
 
     private fun setupRecyclerView() {
         deviceAdapter = DeviceAdapter(
-            onConnect = { device -> viewModel.connectDevice(device.deviceId) },
-            onDisconnect = { device -> viewModel.disconnectDevice(device.deviceId) }
-        )
+            onConnect = { info -> handleConnectionRequest(info) }
+        ) { info -> viewModel.disconnectDevice(info.deviceId) }
         rvDevices.layoutManager = LinearLayoutManager(this)
         rvDevices.adapter = deviceAdapter
+    }
+
+    /**
+     * Production-ready flow for Android 10-17 USB Security
+     */
+    private fun handleConnectionRequest(info: UsbDeviceInfo) {
+        val device = usbManager.deviceList.values.find { it.deviceId == info.deviceId }
+        if (device == null) {
+            ErrorLogger.log("Connection failed: Hardware no longer present (ID: ${info.deviceId})")
+            return
+        }
+
+        if (isUvcDevice(device)) {
+            val hasCameraPerm = ContextCompat.checkSelfPermission(
+                this, 
+                Manifest.permission.CAMERA
+            ) == PackageManager.PERMISSION_GRANTED
+
+            if (!hasCameraPerm) {
+                ErrorLogger.log("UVC Device Detected. Requesting required Camera permission...")
+                pendingDeviceToConnect = device
+                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                return
+            }
+        }
+
+        // Direct path for non-UVC or already authorized devices
+        viewModel.connectDevice(device)
+    }
+
+    /**
+     * Scans all interfaces for USB Video Class (UVC) signatures
+     */
+    private fun isUvcDevice(device: UsbDevice): Boolean {
+        for (i in 0 until device.interfaceCount) {
+            // 14 = UsbConstants.USB_CLASS_VIDEO
+            if (device.getInterface(i).interfaceClass == UsbConstants.USB_CLASS_VIDEO) {
+                return true
+            }
+        }
+        return false
     }
 
     private fun observeState() {
@@ -106,6 +193,14 @@ class MainActivity : ComponentActivity() {
                 launch {
                     viewModel.deviceIp.collectLatest { ip ->
                         tvServerIp.text = getString(R.string.ip_label, ip)
+                    }
+                }
+                launch {
+                    viewModel.statusMessage.collectLatest { msg ->
+                        if (msg != null) {
+                            tvLogStatus.text = msg
+                            tvLogStatus.visibility = View.VISIBLE
+                        }
                     }
                 }
                 launch {
@@ -150,8 +245,8 @@ class MainActivity : ComponentActivity() {
 
     private fun processIntent(intent: Intent) {
         if (intent.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) {
-            val device: android.hardware.usb.UsbDevice? = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, android.hardware.usb.UsbDevice::class.java)
+            val device: UsbDevice? = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
             } else {
                 @Suppress("DEPRECATION")
                 intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)

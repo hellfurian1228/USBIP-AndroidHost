@@ -28,6 +28,9 @@ class UsbDeviceViewModel(private val usbManager: UsbManager) : ViewModel() {
     private val _availableDevices = MutableStateFlow<List<UsbDeviceInfo>>(emptyList())
     private val exportedDevices = MutableStateFlow<Map<String, UsbServerService.DeviceInfo>>(emptyMap())
 
+    private val _statusMessage = MutableStateFlow<String?>(null)
+    val statusMessage: StateFlow<String?> = _statusMessage.asStateFlow()
+
     val devices: StateFlow<List<UsbDeviceInfo>> = combine(_availableDevices, exportedDevices) { available, exported ->
         available.map { device ->
             val exportedInfo = exported.values.find { it.deviceId == device.deviceId }
@@ -132,6 +135,10 @@ class UsbDeviceViewModel(private val usbManager: UsbManager) : ViewModel() {
             )
         }
         _availableDevices.value = infoList
+    }
+
+    fun updateStatus(message: String?) {
+        _statusMessage.value = message
     }
 
     fun connectDevice(deviceId: Int) {

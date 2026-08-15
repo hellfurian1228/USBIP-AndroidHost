@@ -377,11 +377,11 @@ void get_device_info(int device_fd, struct usbip_usb_device *dev, std::vector<st
                 i.bInterfaceProtocol = config_desc[(size_t)pos + 7];
                 intfs->push_back(i);
             } else if (d_type == 0x05 && d_len >= 7) { // Endpoint
-                endpoint_info info = {0};
-                info.addr = config_desc[(size_t)pos + 2];
-                info.type = config_desc[(size_t)pos + 3] & 0x03;
-                info.max_packet_size = (uint16_t)(config_desc[(size_t)pos + 4] | (config_desc[(size_t)pos + 5] << 8));
-                eps->push_back(info);
+                endpoint_info info_item = {0};
+                info_item.addr = config_desc[(size_t)pos + 2];
+                info_item.type = config_desc[(size_t)pos + 3] & 0x03;
+                info_item.max_packet_size = (uint16_t)(config_desc[(size_t)pos + 4] | (config_desc[(size_t)pos + 5] << 8));
+                eps->push_back(info_item);
             }
             pos += (int)d_len;
         }
@@ -395,9 +395,13 @@ void handle_client(int client_fd, int device_fd) {
     std::string current_busid = "1-1";
 
     uint8_t header_buf[8];
-    ssize_t bytes_read = recv(client_fd, header_buf, 8, MSG_WAITALL);
-    if (bytes_read < 8) {
-        LOGW("handle_client: Failed to read 8-byte header (got %zd). Closing.", bytes_read);
+    ssize_t res_bytes_read = recv(client_fd, header_buf, 8, MSG_WAITALL);
+    if (res_bytes_read < 8) {
+        if (res_bytes_read == 0) {
+            LOGI("handle_client: Client disconnected during initial handshake (Probe).");
+        } else {
+            LOGW("handle_client: Failed to read 8-byte header (got %zd, errno: %d). Closing.", res_bytes_read, errno);
+        }
         is_connected->store(false);
         return;
     }
@@ -448,6 +452,7 @@ void handle_client(int client_fd, int device_fd) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
             env->ReleaseByteArrayElements(jpayload, body, JNI_ABORT);
+            env->DeleteLocalRef(jpayload);
         }
 
         if (attached) g_jvm->DetachCurrentThread();
@@ -564,12 +569,12 @@ void handle_client(int client_fd, int device_fd) {
 
         while (true) {
             struct usbip_header header = {0};
-            ssize_t res_bytes_read = recv(client_fd, &header, sizeof(header), MSG_WAITALL);
-            if (res_bytes_read < (ssize_t)sizeof(header)) {
-                if (res_bytes_read == 0) {
+            ssize_t loop_bytes_read = recv(client_fd, &header, sizeof(header), MSG_WAITALL);
+            if (loop_bytes_read < (ssize_t)sizeof(header)) {
+                if (loop_bytes_read == 0) {
                     LOGI("Client closed connection on bus %s.", current_busid.c_str());
                 } else {
-                    LOGE("Short read in CMD loop (got %zd, expected %zu). errno: %d", res_bytes_read, sizeof(header), errno);
+                    LOGE("Short read in CMD loop (got %zd, expected %zu). errno: %d", loop_bytes_read, sizeof(header), errno);
                 }
                 break;
             }
@@ -676,8 +681,8 @@ void handle_client(int client_fd, int device_fd) {
                         }
 
                         unsigned int config_val = wValue;
-                        int res = ioctl(device_fd, USBDEVFS_SETCONFIGURATION, &config_val);
-                        LOGI("SET_CONFIGURATION to %u, res=%d", config_val, res);
+                        int res_sc = ioctl(device_fd, USBDEVFS_SETCONFIGURATION, &config_val);
+                        LOGI("SET_CONFIGURATION to %u, res=%d", config_val, res_sc);
 
                         // Re-secure the interfaces
                         for (int i = 0; i < 16; i++) {
@@ -691,7 +696,7 @@ void handle_client(int client_fd, int device_fd) {
                         ret_sc.devid = ctx->devid;
                         ret_sc.direction = ctx->direction;
                         ret_sc.ep = ctx->ep;
-                        ret_sc.status = (res < 0) ? htonl((uint32_t)-errno) : 0;
+                        ret_sc.status = (res_sc < 0) ? htonl((uint32_t)-errno) : 0;
                         ret_sc.actual_length = 0;
                         send(client_fd, &ret_sc, sizeof(ret_sc), 0);
 
@@ -704,8 +709,8 @@ void handle_client(int client_fd, int device_fd) {
                         struct usbdevfs_setinterface setintf = {0};
                         setintf.interface = wIndex;
                         setintf.altsetting = wValue;
-                        int res = ioctl(device_fd, USBDEVFS_SETINTERFACE, &setintf);
-                        LOGI("SET_INTERFACE %u alt %u, res=%d", wIndex, wValue, res);
+                        int res_si = ioctl(device_fd, USBDEVFS_SETINTERFACE, &setintf);
+                        LOGI("SET_INTERFACE %u alt %u, res=%d", wIndex, wValue, res_si);
 
                         struct usbip_ret_submit ret_si = {0};
                         ret_si.command = htonl(USBIP_RET_SUBMIT);
@@ -713,7 +718,7 @@ void handle_client(int client_fd, int device_fd) {
                         ret_si.devid = ctx->devid;
                         ret_si.direction = ctx->direction;
                         ret_si.ep = ctx->ep;
-                        ret_si.status = (res < 0) ? htonl((uint32_t)-errno) : 0;
+                        ret_si.status = (res_si < 0) ? htonl((uint32_t)-errno) : 0;
                         ret_si.actual_length = 0;
                         send(client_fd, &ret_si, sizeof(ret_si), 0);
 
@@ -970,6 +975,14 @@ Java_com_mizukos_usbip_UsbServerService_startNativeServer(JNIEnv *env, jobject t
     g_service_obj = env->NewGlobalRef(thiz);
 
     std::lock_guard<std::mutex> lock(g_socket_mutex);
+
+    // Safety: Shut down previous server if it's still somehow up
+    if (g_server_socket >= 0) {
+        shutdown(g_server_socket, SHUT_RDWR);
+        close(g_server_socket);
+        g_server_socket = -1;
+    }
+
     g_device_fatal_error.store(false);
     {
         std::unique_lock<std::shared_mutex> dev_lock(g_devices_rw_mutex);
@@ -978,7 +991,6 @@ Java_com_mizukos_usbip_UsbServerService_startNativeServer(JNIEnv *env, jobject t
         }
     }
     if (g_server_thread.joinable()) {
-        LOGW("Warning: Server thread already joinable. Joining before restart.");
         g_server_thread.join();
     }
     g_server_thread = std::thread(run_server, device_fd);
@@ -1034,23 +1046,10 @@ Java_com_mizukos_usbip_UsbServerService_updateDeviceFd(JNIEnv *env, jobject thiz
     LOGI("updateDeviceFd: Received new FD %d for bus %s", new_fd, busid.c_str());
     {
         std::unique_lock<std::shared_mutex> lock(g_devices_rw_mutex);
-        if (g_active_devices.count(busid) && g_active_devices[busid] != -1 && g_active_devices[busid] != new_fd) {
-            close(g_active_devices[busid]);
-        }
+        // Note: We DO NOT call close() on the old FD here.
+        // Android's UsbDeviceConnection manages its own FD lifecycle.
         g_active_devices[busid] = new_fd;
         g_device_fatal_error.store(false);
-    }
-
-    // Claim interfaces 0 and 1 as requested for G29 robustness
-    for (int i = 0; i < 2; i++) {
-        int intf = i;
-        if (ioctl(new_fd, USBDEVFS_CLAIMINTERFACE, &intf) < 0) {
-            if (errno == ENOENT || errno == ENODEV) {
-                LOGI("updateDeviceFd: Interface %d not present, skipping.", i);
-            } else {
-                LOGW("updateDeviceFd: Failed to claim interface %d: %s", i, strerror(errno));
-            }
-        }
     }
 
     g_device_update_cv.notify_all();
@@ -1080,11 +1079,8 @@ Java_com_mizukos_usbip_UsbServerService_invalidateDeviceFd(JNIEnv *env, jobject 
     {
         std::unique_lock<std::shared_mutex> lock(g_devices_rw_mutex);
         if (g_active_devices.count(busid)) {
-            int fd = g_active_devices[busid];
-            if (fd != -1) {
-                LOGI("invalidateDeviceFd: Closing hardware FD %d", fd);
-                close(fd);
-            }
+            // Note: We DO NOT call close() here.
+            // The Kotlin layer's connection.close() handles the system FD release.
             g_active_devices[busid] = -1;
         }
     }

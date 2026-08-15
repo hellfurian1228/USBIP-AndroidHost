@@ -10,7 +10,9 @@ import android.content.pm.ServiceInfo
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
+import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
+import android.util.Log
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -94,13 +96,7 @@ class UsbServerService : Service() {
     private val permissionQueue: Queue<UsbDevice> = LinkedList()
     private var isRequestingPermission = false
 
-    // Cached metadata for JNI (Backward compatibility for single device logic)
-    @Volatile private var cachedBusId: String = "1-1"
-    @Volatile private var cachedVid: Int = 0
-    @Volatile private var cachedPid: Int = 0
-    @Volatile private var cachedProductName: String = ""
-    @Volatile private var cachedInterfaceCount: Int = 0
-
+    // JNI accessors (Now querying the map)
     fun getVidForBusId(busId: String): Int = openedDevices[busId]?.device?.vendorId ?: 0
     fun getPidForBusId(busId: String): Int = openedDevices[busId]?.device?.productId ?: 0
     fun getInterfaceCountForBusId(busId: String): Int = openedDevices[busId]?.device?.interfaceCount ?: 0
@@ -109,6 +105,8 @@ class UsbServerService : Service() {
 
     fun connectDeviceManually(device: UsbDevice) {
         val busId = getBusId(device)
+        // Manual override: clear any stuck pending state to allow a fresh connection attempt
+        pendingConnections.remove(busId)
         authorizedBusIds.add(busId)
         handleIncomingDevice(device)
     }
@@ -121,16 +119,15 @@ class UsbServerService : Service() {
                 performComprehensiveCleanup(busId, deviceId)
             } else {
                 // Fallback for UI sync if tracker is missing
-                val entry = openedDevices.entries.find { it.value.device.deviceId == deviceId }
-                if (entry != null) {
-                    performComprehensiveCleanup(entry.key, deviceId)
+                openedDevices.entries.find { it.value.device.deviceId == deviceId }?.let {
+                    performComprehensiveCleanup(it.key, deviceId)
                 }
             }
         }
     }
 
     private fun performComprehensiveCleanup(busId: String, deviceId: Int) {
-        android.util.Log.i("UsbServerService", "Unified Cleanup Triggered: Bus $busId, Device $deviceId")
+        Log.i("UsbServerService", "Unified Cleanup Triggered: Bus $busId, Device $deviceId")
         
         // 0. Cancel any pending jobs or async handshakes
         deviceJobs.remove(busId)?.cancel()
@@ -144,16 +141,11 @@ class UsbServerService : Service() {
         try {
             handle?.connection?.close()
         } catch (e: Exception) {
-            android.util.Log.e("UsbServerService", "Error closing connection: ${e.message}")
+            Log.e("UsbServerService", "Error closing connection: ${e.message}")
         }
         
         // 3. Purge session trackers
         activeDeviceIdTracker.remove(deviceId)
-        
-        // 4. Reset legacy metadata cache if applicable
-        if (cachedBusId == busId) {
-            resetLegacyMetadata()
-        }
         
         // 5. Reactive UI Sync
         updateUiState()
@@ -177,7 +169,7 @@ class UsbServerService : Service() {
         // Calculate dynamic buffer size: 4 (ndev) + sum(312 + supported_intf_count * 4)
         val totalSize = 4 + exported.sumOf { dev ->
             val supportedCount = (0 until dev.interfaceCount)
-                .mapNotNull { dev.getInterface(it) }
+                .map { dev.getInterface(it) }
                 .count { isInterfaceSupported(it) }
             312 + (minOf(supportedCount, 32) * 4)
         }
@@ -220,7 +212,7 @@ class UsbServerService : Service() {
                         5 -> 5 // SUPER_PLUS
                         else -> 3
                     }
-                } catch (e: Exception) { }
+                } catch (_: Exception) { }
             }
             buffer.putInt(speedValue)
 
@@ -237,7 +229,7 @@ class UsbServerService : Service() {
             
             // Strictly validate supported interface count
             val supportedInterfaces = (0 until device.interfaceCount)
-                .mapNotNull { device.getInterface(it) }
+                .map { device.getInterface(it) }
                 .filter { isInterfaceSupported(it) }
             
             val intfCount = minOf(supportedInterfaces.size, 32)
@@ -253,7 +245,7 @@ class UsbServerService : Service() {
             }
         }
 
-        android.util.Log.i("UsbServerService", "Generated dynamic DEVLIST payload for ${exported.size} device(s)")
+        Log.i("UsbServerService", "Generated dynamic DEVLIST payload for ${exported.size} device(s)")
         return buffer.array()
     }
 
@@ -274,7 +266,7 @@ class UsbServerService : Service() {
                     device?.let { 
                         val profile = getDeviceProfile(it)
                         val busId = getBusId(it)
-                        android.util.Log.i("UsbServerService", "USB attached: ${it.deviceName} (Bus: $busId, Profile: $profile)")
+                        Log.i("UsbServerService", "USB attached: ${it.deviceName} (Bus: $busId, Profile: $profile)")
                         
                         // Auto-connect on attachment: Triggers permission prompt and handles session guard
                         handleIncomingDevice(it)
@@ -283,11 +275,30 @@ class UsbServerService : Service() {
                 ACTION_USB_PERMISSION_SERVICE -> {
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
                     isRequestingPermission = false
-                    if (granted && device != null) {
-                        android.util.Log.i("UsbServerService", "Permission granted for ${device.deviceName}")
-                        attachDevice(device)
+                    
+                    // Retrieve the device from the intent
+                    val targetDevice: UsbDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
                     } else {
-                        android.util.Log.w("UsbServerService", "Permission denied for ${device?.deviceName}")
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    }
+                    
+                    val deviceName = targetDevice?.productName ?: targetDevice?.deviceName ?: "Unknown"
+                    Log.i("UsbServerService", "Permission Result: granted=$granted for $deviceName")
+                    
+                    if (granted && targetDevice != null) {
+                        ErrorLogger.log(getString(R.string.permission_granted_msg, deviceName))
+                        attachDevice(targetDevice)
+                    } else {
+                        Log.w("UsbServerService", "Permission DENIED for $deviceName")
+                        ErrorLogger.log(getString(R.string.permission_denied_msg, deviceName))
+                        
+                        targetDevice?.let { usbDev ->
+                            val busId = activeDeviceIdTracker[usbDev.deviceId] ?: getBusId(usbDev)
+                            pendingConnections.remove(busId)
+                            updateUiState()
+                        }
                     }
                     processNextPermissionRequest()
                 }
@@ -338,32 +349,32 @@ class UsbServerService : Service() {
         
         // 1. Session State Guard: Prevent duplicate port bindings or ghost sessions
         if (activeDeviceIdTracker.containsKey(device.deviceId)) {
-            android.util.Log.i("UsbServerService", "Session Guard: Device ${device.deviceId} is already active. Ignoring duplicate request.")
+            Log.i("UsbServerService", "Session Guard: Device ${device.deviceId} is already active. Ignoring duplicate request.")
             return
         }
         
         // Prevent multiple simultaneous connection attempts for the same discovery ID
         if (pendingConnections.containsKey(busId)) {
-            android.util.Log.i("UsbServerService", "Session Guard: Device on bus $busId is already in pending state.")
+            Log.i("UsbServerService", "Session Guard: Device on bus $busId is already in pending state.")
             return
         }
 
-        android.util.Log.i("UsbServerService", "Incoming USB: ${device.deviceName} (VID=${device.vendorId}, PID=${device.productId}) -> Profile: $profile")
+        Log.i("UsbServerService", "Incoming USB: ${device.deviceName} (VID=${device.vendorId}, PID=${device.productId}) -> Profile: $profile")
         
-        // 1. & 2. Validate device for unsupported characteristics
+        // 2. Validate device for unsupported characteristics
         if (!isDeviceSupported(device)) {
-            android.util.Log.w("UsbServerService", "Aborting connection: No supported interfaces found on device.")
+            Log.w("UsbServerService", "Aborting connection: No supported interfaces found on device.")
             serviceScope.launch(Dispatchers.Main) {
                 Toast.makeText(applicationContext, "This device consists exclusively of unsupported interfaces (Audio/Isochronous)", Toast.LENGTH_LONG).show()
             }
             return
         }
 
-        pendingConnections[busId] = device.deviceId
-        updateUiState()
-
-        // 2. Permission and Attachment Logic
+        // 3. Permission and Attachment Logic
         if (usbManager.hasPermission(device)) {
+            pendingConnections[busId] = device.deviceId
+            updateUiState()
+            
             // Cancel any previous job for this busId to avoid race conditions
             deviceJobs.remove(busId)?.cancel()
             
@@ -380,7 +391,7 @@ class UsbServerService : Service() {
         }
     }
 
-    private fun isInterfaceSupported(intf: android.hardware.usb.UsbInterface): Boolean {
+    private fun isInterfaceSupported(intf: UsbInterface): Boolean {
         // Reject Audio Class interfaces
         if (intf.interfaceClass == UsbConstants.USB_CLASS_AUDIO) {
             return false
@@ -403,7 +414,7 @@ class UsbServerService : Service() {
                 return true
             }
         }
-        android.util.Log.w("UsbServerService", "Validation Failed: Device ${device.deviceName} has no supported interfaces.")
+        Log.w("UsbServerService", "Validation Failed: Device ${device.deviceName} has no supported interfaces.")
         return false
     }
 
@@ -412,26 +423,47 @@ class UsbServerService : Service() {
         
         val device = permissionQueue.poll() ?: return
         isRequestingPermission = true
+        
+        // UI Sync: Show connecting state now that we are actually triggering the prompt
+        val busId = getBusId(device)
+        pendingConnections[busId] = device.deviceId
+        updateUiState()
+        
         requestPermissionForDevice(device)
+        
+        // Safety timeout for permission dialog
+        serviceScope.launch {
+            delay(30000L) // 30 seconds
+            if (isRequestingPermission) {
+                isRequestingPermission = false
+                Log.w("UsbServerService", "Permission request timed out for ${device.deviceName}")
+                val currentBusId = activeDeviceIdTracker[device.deviceId] ?: getBusId(device)
+                pendingConnections.remove(currentBusId)
+                updateUiState()
+                processNextPermissionRequest()
+            }
+        }
     }
 
     private fun requestPermissionForDevice(device: UsbDevice) {
-        val intent = Intent(ACTION_USB_PERMISSION_SERVICE).apply {
-            setPackage(packageName) // Ensure intent is explicit for Android 14+
-            putExtra(UsbManager.EXTRA_DEVICE, device)
-        }
-        
-        val permissionIntent = android.app.PendingIntent.getBroadcast(
-            this, 
-            device.deviceId, 
-            intent,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                android.app.PendingIntent.FLAG_MUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
-            } else {
-                android.app.PendingIntent.FLAG_UPDATE_CURRENT
+        serviceScope.launch(Dispatchers.Main) {
+            val intent = Intent(ACTION_USB_PERMISSION_SERVICE).apply {
+                setPackage(packageName)
+                putExtra(UsbManager.EXTRA_DEVICE, device)
             }
-        )
-        usbManager.requestPermission(device, permissionIntent)
+            
+            // Use deviceId as requestCode to ensure unique PendingIntents without URI overhead
+            val permissionIntent = android.app.PendingIntent.getBroadcast(
+                this@UsbServerService, 
+                device.deviceId,
+                intent,
+                android.app.PendingIntent.FLAG_MUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            
+            val name = device.productName ?: "USB Device (${device.vendorId}:${device.productId})"
+            ErrorLogger.log(getString(R.string.requesting_permission_msg, name))
+            usbManager.requestPermission(device, permissionIntent)
+        }
     }
 
     private fun attachDevice(device: UsbDevice) {
@@ -441,7 +473,7 @@ class UsbServerService : Service() {
         try {
             val connection = usbManager.openDevice(device)
             if (connection != null) {
-                android.util.Log.i("UsbServerService", "Attaching device: ${device.productName} as $busId (Profile: $profile)")
+                Log.i("UsbServerService", "Attaching device: ${device.productName} as $busId (Profile: $profile)")
                 
                 // Track active session before claiming interfaces
                 activeDeviceIdTracker[device.deviceId] = busId
@@ -450,11 +482,11 @@ class UsbServerService : Service() {
                 if (profile != SpecialDeviceProfile.ETHERNET) {
                     for (i in 0 until device.interfaceCount) {
                         // Strict null-safety and bounds-checking for composite interfaces
-                        val intf = device.getInterface(i) ?: continue
+                        val intf = device.getInterface(i)
                         
                         // Skip unsupported interfaces (Audio/ISOC) in composite devices
                         if (!isInterfaceSupported(intf)) {
-                            android.util.Log.i("UsbServerService", "Skipping unsupported interface $i (Class: ${intf.interfaceClass})")
+                            Log.i("UsbServerService", "Skipping unsupported interface $i (Class: ${intf.interfaceClass})")
                             continue
                         }
 
@@ -462,9 +494,14 @@ class UsbServerService : Service() {
                             // Force claim detaches native kernel ownership if a driver is active
                             val success = connection.claimInterface(intf, true)
                             if (success) {
-                                android.util.Log.i("UsbServerService", "Successfully claimed interface $i (Class: ${intf.interfaceClass})")
+                                Log.i("UsbServerService", "Successfully claimed interface $i (Class: ${intf.interfaceClass})")
                             } else {
-                                android.util.Log.w("UsbServerService", "Failed to claim interface $i - locked by OS or driver.")
+                                // Downgrade log level for HID interfaces which are often locked by Android system
+                                if (intf.interfaceClass == UsbConstants.USB_CLASS_HID) {
+                                    Log.i("UsbServerService", "Interface $i (HID) is handled by Android system. Bypassing.")
+                                } else {
+                                    android.util.Log.w("UsbServerService", "Failed to claim interface $i (Class: ${intf.interfaceClass}) - locked by OS or driver.")
+                                }
                             }
                         } catch (e: Exception) {
                             android.util.Log.e("UsbServerService", "Exception claiming interface $i: ${e.message}")
@@ -476,9 +513,6 @@ class UsbServerService : Service() {
 
                 val handle = DeviceHandle(device, connection, busId, profile)
                 openedDevices[busId] = handle
-                
-                // Update single-device legacy cache
-                updateLegacyMetadata(device, busId)
                 
                 // Notify native layer
                 updateDeviceFd(busId, connection.fileDescriptor)
@@ -549,22 +583,6 @@ class UsbServerService : Service() {
         performComprehensiveCleanup(busId, device.deviceId)
     }
 
-    private fun resetLegacyMetadata() {
-        cachedVid = 0
-        cachedPid = 0
-        cachedProductName = ""
-        cachedInterfaceCount = 0
-        cachedBusId = "1-0"
-    }
-
-    private fun updateLegacyMetadata(device: UsbDevice, busId: String) {
-        cachedVid = device.vendorId
-        cachedPid = device.productId
-        cachedProductName = device.productName ?: "Unknown Device"
-        cachedInterfaceCount = device.interfaceCount
-        cachedBusId = busId
-    }
-
     override fun onCreate() {
         super.onCreate()
         android.util.Log.i("UsbServerService", "Service onCreate")
@@ -595,7 +613,7 @@ class UsbServerService : Service() {
             this,
             usbReceiver,
             filter,
-            ContextCompat.RECEIVER_NOT_EXPORTED
+            ContextCompat.RECEIVER_EXPORTED // Required for system-triggered callbacks on some Android 14 devices
         )
     }
 

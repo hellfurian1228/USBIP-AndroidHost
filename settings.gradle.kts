@@ -22,6 +22,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "USBIP"
+rootProject.name = "USBIP-AndroidHost"
 include(":app")
  

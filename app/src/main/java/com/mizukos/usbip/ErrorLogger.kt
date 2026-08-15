@@ -12,6 +12,8 @@ object ErrorLogger {
     private val logBuffer = ConcurrentLinkedQueue<String>()
     private val maxLogs = 50
 
+    var onLogCallback: ((String) -> Unit)? = null
+
     fun log(message: String, throwable: Throwable? = null) {
         val timestamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date())
         val logEntry = "[$timestamp] $message" + (throwable?.let { "\n${android.util.Log.getStackTraceString(it)}" } ?: "")
@@ -22,6 +24,7 @@ object ErrorLogger {
         }
         
         android.util.Log.e("USBIP_Error", message, throwable)
+        onLogCallback?.invoke(message)
     }
 
     fun copyLogsToClipboard(context: Context) {
