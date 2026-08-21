@@ -35,8 +35,13 @@ class UsbipNsdManager(context: Context) {
             serviceType = SERVICE_TYPE
             setPort(port)
             try {
-                // Set the device's current local IP address as requested
-                host = InetAddress.getByName(getDeviceIpAddress())
+                val address = InetAddress.getByName(getDeviceIpAddress())
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    setHostAddresses(listOf(address))
+                } else {
+                    @Suppress("DEPRECATION")
+                    host = address
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to set host IP: ${e.message}")
             }

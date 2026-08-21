@@ -503,15 +503,15 @@ class UsbServerService : Service() {
                                 if (intf.interfaceClass == UsbConstants.USB_CLASS_HID) {
                                     Log.i("UsbServerService", "Interface $i (HID) is handled by Android system. Bypassing.")
                                 } else {
-                                    android.util.Log.w("UsbServerService", "Failed to claim interface $i (Class: ${intf.interfaceClass}) - locked by OS or driver.")
+                                    Log.w("UsbServerService", "Failed to claim interface $i (Class: ${intf.interfaceClass}) - locked by OS or driver.")
                                 }
                             }
                         } catch (e: Exception) {
-                            android.util.Log.e("UsbServerService", "Exception claiming interface $i: ${e.message}")
+                            Log.e("UsbServerService", "Exception claiming interface $i: ${e.message}")
                         }
                     }
                 } else {
-                    android.util.Log.i("UsbServerService", "Bypassing driver eviction for Ethernet profile")
+                    Log.i("UsbServerService", "Bypassing driver eviction for Ethernet profile")
                 }
 
                 val handle = DeviceHandle(device, connection, busId, profile)
@@ -521,7 +521,7 @@ class UsbServerService : Service() {
                 updateDeviceFd(busId, connection.fileDescriptor)
             } else {
                 val errorMsg = "Failed to open connection for ${device.deviceName} (OS-level lock or denied)"
-                android.util.Log.e("UsbServerService", errorMsg)
+                Log.e("UsbServerService", errorMsg)
                 ErrorLogger.log(errorMsg)
                 serviceScope.launch(Dispatchers.Main) {
                     Toast.makeText(applicationContext, "Failed to open device connection (Locked by OS)", Toast.LENGTH_SHORT).show()
@@ -529,7 +529,7 @@ class UsbServerService : Service() {
             }
         } catch (e: Exception) {
             val errorMsg = "Crash-safe catch during device attach: ${e.message}"
-            android.util.Log.e("UsbServerService", errorMsg)
+            Log.e("UsbServerService", errorMsg)
             ErrorLogger.log(errorMsg, e)
             e.printStackTrace()
         } finally {
@@ -588,7 +588,7 @@ class UsbServerService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        android.util.Log.i("UsbServerService", "Service onCreate")
+        Log.i("UsbServerService", "Service onCreate")
         usbManager = getSystemService(USB_SERVICE) as UsbManager
         usbipNsdManager = UsbipNsdManager(this)
         
@@ -599,7 +599,7 @@ class UsbServerService : Service() {
         }
 
         // Acquire WifiLock for high performance
-        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
         wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "UsbIpWifiLock").apply {
             acquire()
         }
@@ -608,7 +608,12 @@ class UsbServerService : Service() {
 
         val notification = createNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            }
+            startForeground(NOTIFICATION_ID, notification, type)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
@@ -628,12 +633,12 @@ class UsbServerService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        android.util.Log.i("UsbServerService", "Service onStartCommand")
+        Log.i("UsbServerService", "Service onStartCommand")
         
         serviceScope.launch {
             nativeServerMutex.withLock {
                 if (!isNativeServerStarted) {
-                    android.util.Log.i("UsbServerService", "Starting persistent native server daemon")
+                    Log.i("UsbServerService", "Starting persistent native server daemon")
                     startNativeServer(-1) // Start as daemon without initial device
                     isNativeServerStarted = true
                     usbipNsdManager.registerService(3240)
@@ -661,7 +666,7 @@ class UsbServerService : Service() {
     }
 
     override fun onDestroy() {
-        android.util.Log.i("UsbServerService", "Service onDestroy")
+        Log.i("UsbServerService", "Service onDestroy")
         unregisterReceiver(usbReceiver)
         
         wakeLock?.let {
