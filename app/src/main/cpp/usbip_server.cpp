@@ -29,6 +29,7 @@
 
 #define USBIP_PORT 3240
 #define USBIP_VERSION 0x0111
+#define FLAG_REQUEST_UDP 0x01
 
 static int g_server_socket = -1;
 static std::mutex g_socket_mutex;
@@ -142,7 +143,7 @@ struct endpoint_info {
     uint8_t addr;
     uint8_t type;
     uint16_t max_packet_size;
-};
+} __attribute__((packed));
 
 struct usbip_header {
     uint32_t command;
@@ -174,13 +175,16 @@ struct usbip_ret_submit {
 
 struct async_urb_context {
     int client_fd;
+    int udp_fd; // -1 for TCP, >= 0 for UDP
+    struct sockaddr_in client_addr;
+    uint32_t udp_seq_id;
     uint32_t seqnum;
     uint32_t devid;
     uint32_t direction;
     uint32_t ep;
     uint8_t* payload_buffer;
     struct usbdevfs_urb urb; // Must be at the end
-};
+} __attribute__((packed));
 
 std::atomic<int> in_flight_urbs_count{0};
 std::mutex in_flight_mutex;
@@ -198,6 +202,23 @@ void cleanup_zombie_urbs(int device_fd, int client_fd) {
         }
     }
     LOGI("Triggered hardware discard for %d zombie URBs.", discarded_count);
+}
+
+ssize_t send_all(int fd, const void *buf, size_t len) {
+    size_t total = 0;
+    const char *p = (const char *)buf;
+    while (total < len) {
+        ssize_t n = send(fd, p + total, len - total, 0);
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                continue;
+            }
+            return (n == 0) ? (ssize_t)total : n;
+        }
+        total += (size_t)n;
+    }
+    return (ssize_t)total;
 }
 
 void reap_thread(std::string busid, int device_fd, const std::shared_ptr<std::atomic<bool>>& is_connected) {
@@ -250,25 +271,52 @@ void reap_thread(std::string busid, int device_fd, const std::shared_ptr<std::at
 
         if (urb->status != 0 && urb->status != -ENOENT) {
             if (urb->status == -EPIPE) {
-                LOGW("Endpoint stalled (EPIPE) on bus %s, ep=%u, seq=%u. Reporting to client.", busid.c_str(), ntohl(ctx->ep), ntohl(ctx->seqnum));
+                LOGW("Endpoint stalled (EPIPE) on bus %s, ep=0x%02x, seq=%u. Clearing halt and reporting to client.",
+                     busid.c_str(), ctx->urb.endpoint, ntohl(ctx->seqnum));
+
+                uint32_t ep_addr = ctx->urb.endpoint;
+                if (ioctl(device_fd, USBDEVFS_CLEAR_HALT, &ep_addr) < 0) {
+                    LOGE("USBDEVFS_CLEAR_HALT failed for ep 0x%02x: %s", ep_addr, strerror(errno));
+                }
             } else {
                 LOGE("URB failed with status %d (ep=%u, seq=%u) on bus %s", (int)urb->status, ntohl(ctx->ep), ntohl(ctx->seqnum), busid.c_str());
             }
         }
 
+        if (ntohl(ctx->ep) == 0) {
+            LOGI("<<< USBIP_RET_SUBMIT (EP0): seq=%u, status=%d, actual_len=%u, bus=%s",
+                 ntohl(ctx->seqnum), (int32_t)ntohl(ret.status), (uint32_t)ntohl(ret.actual_length), busid.c_str());
+        }
+
         if (is_connected->load()) {
-            if (send(ctx->client_fd, &ret, sizeof(ret), 0) < 0) {
-                LOGE("Failed to send RET_SUBMIT header");
-            } else if (urb->actual_length > 0 && ntohl(ctx->direction) == 1) {
-                uint8_t* data_ptr = ctx->payload_buffer;
-                if (ctx->urb.type == USBDEVFS_URB_TYPE_CONTROL) {
-                    data_ptr += 8;
+            if (ctx->udp_fd != -1) {
+                // Wrap with 4-byte sequence ID
+                uint8_t out_buf[65536 + 64];
+                uint32_t seq_net = htonl(ctx->udp_seq_id);
+                memcpy(out_buf, &seq_net, 4);
+                memcpy(out_buf + 4, &ret, sizeof(ret));
+                size_t out_len = 4 + sizeof(ret);
+
+                if (urb->actual_length > 0 && ntohl(ctx->direction) == 1) {
+                    uint8_t* data_ptr = ctx->payload_buffer;
+                    if (ctx->urb.type == USBDEVFS_URB_TYPE_CONTROL) data_ptr += 8;
+                    memcpy(out_buf + out_len, data_ptr, urb->actual_length);
+                    out_len += urb->actual_length;
                 }
-                if (send(ctx->client_fd, data_ptr, urb->actual_length, 0) < 0) {
-                    LOGE("Failed to send RET_SUBMIT data");
+                sendto(ctx->udp_fd, out_buf, out_len, 0, (struct sockaddr*)&ctx->client_addr, sizeof(ctx->client_addr));
+            } else {
+                if (send_all(ctx->client_fd, &ret, sizeof(ret)) < 0) {
+                    LOGE("Failed to send RET_SUBMIT header");
+                } else if (urb->actual_length > 0 && ntohl(ctx->direction) == 1) {
+                    uint8_t* data_ptr = ctx->payload_buffer;
+                    if (ctx->urb.type == USBDEVFS_URB_TYPE_CONTROL) data_ptr += 8;
+                    if (send_all(ctx->client_fd, data_ptr, urb->actual_length) < 0) {
+                        LOGE("Failed to send RET_SUBMIT data");
+                    }
                 }
             }
-            LOGI("<<< USBIP_RET_SUBMIT: seq=%u, status=%d, len=%u, bus=%s",
+            LOGI("<<< USBIP_RET_SUBMIT (%s): seq=%u, status=%d, len=%u, bus=%s",
+                 (ctx->udp_fd != -1 ? "UDP" : "TCP"),
                  ntohl(ctx->seqnum), (int32_t)ntohl(ret.status), (uint32_t)ntohl(ret.actual_length), busid.c_str());
         }
 
@@ -368,6 +416,197 @@ void get_device_info(int device_fd, struct usbip_usb_device *dev, std::vector<st
     if (dev->bNumInterfaces == 0) dev->bNumInterfaces = 1;
 }
 
+void udp_worker_loop(int udp_fd, int device_fd, std::vector<endpoint_info> eps, std::string busid, std::shared_ptr<std::atomic<bool>> is_connected, int client_tcp_fd) {
+    LOGI("UDP Worker loop started for bus %s", busid.c_str());
+
+    // Enforce strict non-blocking timeouts
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 500000; // 500ms
+    setsockopt(udp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in from_addr;
+    socklen_t addr_len = sizeof(from_addr);
+    uint8_t packet[65536 + 4];
+    int timeout_count = 0;
+
+    while (is_connected->load()) {
+        struct pollfd pfd;
+        pfd.fd = udp_fd;
+        pfd.events = POLLIN;
+
+        int poll_ret = poll(&pfd, 1, 500);
+        if (poll_ret < 0) {
+            if (errno == EINTR) continue;
+            LOGE("UDP poll error on bus %s: %s", busid.c_str(), strerror(errno));
+            break;
+        }
+
+        if (poll_ret == 0) {
+            timeout_count++;
+            if (timeout_count > 60) { // 30 seconds of silence
+                LOGW("UDP worker: No data for 30s. Terminating UDP path for bus %s.", busid.c_str());
+                break;
+            }
+            continue;
+        }
+
+        timeout_count = 0;
+        ssize_t n = recvfrom(udp_fd, packet, sizeof(packet), 0, (struct sockaddr*)&from_addr, &addr_len);
+        if (n < 4 + (ssize_t)sizeof(struct usbip_header)) continue;
+
+        // Strip 4-byte Sequence ID header
+        uint32_t udp_seq_id = ntohl(*(uint32_t*)packet);
+        struct usbip_header* header = (struct usbip_header*)(packet + 4);
+        uint32_t command = ntohl(header->command);
+
+        if (command == USBIP_CMD_SUBMIT) {
+            // Check for device FD update before submitting (Shared lock)
+            {
+                std::shared_lock<std::shared_mutex> lock(g_devices_rw_mutex);
+                if (g_active_devices.count(busid) && g_active_devices[busid] != -1 && g_active_devices[busid] != device_fd) {
+                    device_fd = g_active_devices[busid];
+                }
+            }
+
+            if (device_fd == -1) continue;
+
+            uint32_t ep = ntohl(header->ep) & 0x7F;
+            uint32_t dir = ntohl(header->direction);
+            uint32_t transfer_len = ntohl(header->transfer_buffer_length);
+
+            auto *ctx = (async_urb_context *)calloc(1, sizeof(async_urb_context));
+            if (!ctx) continue;
+            ctx->client_fd = client_tcp_fd;
+            ctx->udp_fd = udp_fd;
+            ctx->client_addr = from_addr;
+            ctx->udp_seq_id = udp_seq_id;
+            ctx->seqnum = header->seqnum;
+            ctx->devid = header->devid;
+            ctx->direction = header->direction;
+            ctx->ep = header->ep;
+
+            if (ep == 0) {
+                ctx->payload_buffer = new uint8_t[8 + (size_t)transfer_len];
+                memcpy(ctx->payload_buffer, header->setup, 8);
+                if (dir == 0 && transfer_len > 0) {
+                    if (n >= (ssize_t)(4 + sizeof(struct usbip_header) + transfer_len)) {
+                        memcpy(ctx->payload_buffer + 8, packet + 4 + sizeof(struct usbip_header), transfer_len);
+                    }
+                }
+                ctx->urb.type = USBDEVFS_URB_TYPE_CONTROL;
+                ctx->urb.buffer = ctx->payload_buffer;
+                ctx->urb.buffer_length = (int)(8 + transfer_len);
+            } else {
+                if (transfer_len > 0) {
+                    ctx->payload_buffer = new uint8_t[transfer_len];
+                    if (dir == 0 && n >= (ssize_t)(4 + sizeof(struct usbip_header) + transfer_len)) {
+                        memcpy(ctx->payload_buffer, packet + 4 + sizeof(struct usbip_header), transfer_len);
+                    }
+                } else {
+                    ctx->payload_buffer = nullptr;
+                }
+                ctx->urb.buffer = ctx->payload_buffer;
+                ctx->urb.buffer_length = (int)transfer_len;
+
+                uint8_t ep_addr = (uint8_t)(ep | (dir ? 0x80 : 0));
+                uint8_t ep_type = 0x02;
+                for (const auto& item : eps) {
+                    if (item.addr == ep_addr) { ep_type = item.type; break; }
+                }
+                ctx->urb.type = (ep_type == 0x01) ? 0 : ((ep_type == 0x03) ? 1 : 3);
+            }
+            ctx->urb.usercontext = ctx;
+            ctx->urb.endpoint = (unsigned char)(ep | (dir == 1 ? 0x80 : 0));
+
+            // Synchronous EP0 handling
+            if (ep == 0) {
+                uint8_t bmRequestType = header->setup[0];
+                uint8_t bRequest      = header->setup[1];
+                uint16_t wValue = (uint16_t)(header->setup[2] | (header->setup[3] << 8));
+                uint16_t wIndex = (uint16_t)(header->setup[4] | (header->setup[5] << 8));
+                uint16_t wLength = (uint16_t)transfer_len;
+
+                LOGI("UDP EP0 Control Request: bmRequestType=0x%02x, bRequest=0x%02x, wValue=0x%04x, wIndex=0x%04x, wLength=%u",
+                     bmRequestType, bRequest, wValue, wIndex, wLength);
+
+                if (bmRequestType == 0x00 && bRequest == 0x09) { // SET_CONFIGURATION
+                    LOGI("UDP: Intercepted SET_CONFIGURATION");
+                    for (int i = 0; i < 16; i++) { int intf = i; ioctl(device_fd, USBDEVFS_RELEASEINTERFACE, &intf); }
+                    unsigned int config_val = wValue;
+                    int res_sc = ioctl(device_fd, USBDEVFS_SETCONFIGURATION, &config_val);
+                    for (int i = 0; i < 16; i++) { int intf = i; ioctl(device_fd, USBDEVFS_CLAIMINTERFACE, &intf); }
+
+                    struct usbip_ret_submit ret = {0};
+                    ret.command = htonl(USBIP_RET_SUBMIT);
+                    ret.seqnum = ctx->seqnum; ret.devid = ctx->devid; ret.direction = ctx->direction; ret.ep = ctx->ep;
+                    ret.status = (res_sc < 0) ? htonl((uint32_t)-errno) : 0;
+
+                    uint8_t out_buf[52];
+                    uint32_t s_net = htonl(udp_seq_id);
+                    memcpy(out_buf, &s_net, 4);
+                    memcpy(out_buf + 4, &ret, sizeof(ret));
+                    sendto(udp_fd, out_buf, 52, 0, (struct sockaddr*)&from_addr, sizeof(from_addr));
+                    delete[] ctx->payload_buffer; free(ctx); continue;
+                } else if (bmRequestType == 0x01 && bRequest == 0x0B) { // SET_INTERFACE
+                    LOGI("UDP: Intercepted SET_INTERFACE");
+                    struct usbdevfs_setinterface setintf = {0};
+                    setintf.interface = wIndex; setintf.altsetting = wValue;
+                    int res_si = ioctl(device_fd, USBDEVFS_SETINTERFACE, &setintf);
+
+                    struct usbip_ret_submit ret = {0};
+                    ret.command = htonl(USBIP_RET_SUBMIT);
+                    ret.seqnum = ctx->seqnum; ret.devid = ctx->devid; ret.direction = ctx->direction; ret.ep = ctx->ep;
+                    ret.status = (res_si < 0) ? htonl((uint32_t)-errno) : 0;
+
+                    uint8_t out_buf[52];
+                    uint32_t s_net = htonl(udp_seq_id);
+                    memcpy(out_buf, &s_net, 4);
+                    memcpy(out_buf + 4, &ret, sizeof(ret));
+                    sendto(udp_fd, out_buf, 52, 0, (struct sockaddr*)&from_addr, sizeof(from_addr));
+                    delete[] ctx->payload_buffer; free(ctx); continue;
+                } else if (bmRequestType == 0x00 && bRequest == 0x05) { // SET_ADDRESS
+                    LOGI("UDP: Intercepted SET_ADDRESS");
+                    struct usbip_ret_submit ret = {0};
+                    ret.command = htonl(USBIP_RET_SUBMIT);
+                    ret.seqnum = ctx->seqnum; ret.devid = ctx->devid; ret.direction = ctx->direction; ret.ep = ctx->ep;
+
+                    uint8_t out_buf[52];
+                    uint32_t s_net = htonl(udp_seq_id);
+                    memcpy(out_buf, &s_net, 4);
+                    memcpy(out_buf + 4, &ret, sizeof(ret));
+                    sendto(udp_fd, out_buf, 52, 0, (struct sockaddr*)&from_addr, sizeof(from_addr));
+                    delete[] ctx->payload_buffer; free(ctx); continue;
+                } else if (bmRequestType == 0x02 && bRequest == 0x01 && wValue == 0x0000) { // CLEAR_FEATURE
+                    uint32_t target_endpoint = wIndex & 0xFF;
+                    LOGI("UDP: Intercepted CLEAR_FEATURE (ENDPOINT_HALT) for ep 0x%02x", target_endpoint);
+                    ioctl(device_fd, USBDEVFS_CLEAR_HALT, &target_endpoint);
+                }
+            }
+
+            { std::lock_guard<std::mutex> lock(in_flight_mutex); active_urbs[ntohl(ctx->seqnum)] = ctx; in_flight_urbs_count++; }
+            if (ioctl(device_fd, USBDEVFS_SUBMITURB, &ctx->urb) < 0) {
+                { std::lock_guard<std::mutex> lock(in_flight_mutex); active_urbs.erase(ntohl(ctx->seqnum)); in_flight_urbs_count--; }
+                struct usbip_ret_submit ret_err = {0};
+                ret_err.command = htonl(USBIP_RET_SUBMIT);
+                ret_err.seqnum = ctx->seqnum; ret_err.devid = ctx->devid; ret_err.direction = ctx->direction; ret_err.ep = ctx->ep;
+                ret_err.status = htonl((uint32_t)-errno);
+
+                uint8_t out_buf[52];
+                uint32_t s_net = htonl(udp_seq_id);
+                memcpy(out_buf, &s_net, 4);
+                memcpy(out_buf + 4, &ret_err, sizeof(ret_err));
+                sendto(udp_fd, out_buf, 52, 0, (struct sockaddr*)&from_addr, sizeof(from_addr));
+
+                delete[] ctx->payload_buffer; free(ctx);
+            }
+        }
+    }
+
+    LOGI("Gracefully releasing UDP resources for bus %s", busid.c_str());
+    close(udp_fd);
+}
+
 void handle_client(int client_fd, int device_fd) {
     auto is_connected = std::make_shared<std::atomic<bool>>(true);
     std::string current_busid = "1-1";
@@ -415,12 +654,50 @@ void handle_client(int client_fd, int device_fd) {
     }
 
     if (code == OP_REQ_IMPORT) {
-        struct op_req_import import_req = {0};
-        if (recv_all(client_fd, &import_req, sizeof(import_req)) < (ssize_t)sizeof(import_req)) {
+        char busid_buf[32];
+        if (recv_all(client_fd, busid_buf, 32) < 32) {
             is_connected->store(false);
             return;
         }
-        std::string busid(import_req.busid, strnlen(import_req.busid, 32));
+        std::string busid(busid_buf, strnlen(busid_buf, 32));
+
+        uint32_t flags = 0;
+        struct pollfd pfd_flags;
+        pfd_flags.fd = client_fd;
+        pfd_flags.events = POLLIN;
+        if (poll(&pfd_flags, 1, 100) > 0) {
+            recv(client_fd, &flags, sizeof(flags), 0);
+            flags = ntohl(flags);
+        }
+
+        bool use_udp = (flags & FLAG_REQUEST_UDP) != 0;
+        int udp_fd = -1;
+        uint16_t udp_port = 0;
+
+        if (use_udp) {
+            udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+            if (udp_fd >= 0) {
+                struct sockaddr_in udp_addr = {0};
+                udp_addr.sin_family = AF_INET;
+                udp_addr.sin_addr.s_addr = INADDR_ANY;
+                udp_addr.sin_port = htons(3241);
+                if (bind(udp_fd, (struct sockaddr*)&udp_addr, sizeof(udp_addr)) < 0) {
+                    udp_addr.sin_port = 0;
+                    if (bind(udp_fd, (struct sockaddr*)&udp_addr, sizeof(udp_addr)) < 0) {
+                        close(udp_fd); udp_fd = -1; use_udp = false;
+                    }
+                }
+                if (udp_fd != -1) {
+                    socklen_t slen = sizeof(udp_addr);
+                    getsockname(udp_fd, (struct sockaddr*)&udp_addr, &slen);
+                    udp_port = ntohs(udp_addr.sin_port);
+                    LOGI("Experimental UDP path requested. Bound to port %d", udp_port);
+                }
+            } else {
+                use_udp = false;
+            }
+        }
+
         int resolved_fd = get_int_for_busid("getFdForBusId", busid);
         if (resolved_fd == -1) {
             struct op_common err_header = {0};
@@ -429,6 +706,7 @@ void handle_client(int client_fd, int device_fd) {
             err_header.status = htonl(1);
             send(client_fd, &err_header, sizeof(err_header), 0);
             is_connected->store(false);
+            if (udp_fd != -1) close(udp_fd);
             return;
         }
         device_fd = resolved_fd;
@@ -451,16 +729,35 @@ void handle_client(int client_fd, int device_fd) {
 
         send(client_fd, &reply_header, sizeof(reply_header), 0);
         send(client_fd, &dev, sizeof(dev), 0);
+        if (use_udp) {
+            uint32_t p_net = htonl((uint32_t)udp_port);
+            send(client_fd, &p_net, sizeof(p_net), 0);
+        }
 
         std::thread(reap_thread, current_busid, device_fd, is_connected).detach();
 
+        if (use_udp) {
+            std::thread(udp_worker_loop, udp_fd, device_fd, eps, busid, is_connected, client_fd).detach();
+        }
+
         for (int i = 0; i < 16; i++) {
-            struct usbdevfs_ioctl disconnect = {0};
-            disconnect.ifno = i;
-            disconnect.ioctl_code = USBDEVFS_DISCONNECT;
-            ioctl(device_fd, USBDEVFS_IOCTL, &disconnect);
+            struct usbdevfs_getdriver get_driver = {0};
+            get_driver.interface = i;
+
+            if (ioctl(device_fd, USBDEVFS_GETDRIVER, &get_driver) == 0) {
+                LOGI("Interface %d has active driver: %s. Detaching...", i, get_driver.driver);
+                struct usbdevfs_ioctl disconnect = {0};
+                disconnect.ifno = i;
+                disconnect.ioctl_code = USBDEVFS_DISCONNECT;
+                if (ioctl(device_fd, USBDEVFS_IOCTL, &disconnect) < 0) {
+                    LOGE("Failed to detach kernel driver on interface %d: %s", i, strerror(errno));
+                }
+            }
+
             int intf = i;
-            ioctl(device_fd, USBDEVFS_CLAIMINTERFACE, &intf);
+            if (ioctl(device_fd, USBDEVFS_CLAIMINTERFACE, &intf) == 0) {
+                LOGI("Successfully claimed interface %d", i);
+            }
         }
 
         while (is_connected->load()) {
@@ -468,14 +765,35 @@ void handle_client(int client_fd, int device_fd) {
             if (recv_all(client_fd, &cmd_header, sizeof(cmd_header)) < (ssize_t)sizeof(cmd_header)) break;
 
             uint32_t command = ntohl(cmd_header.command);
+
+            if (use_udp && command == USBIP_CMD_SUBMIT) {
+                // Skip payload if any (it will be handled via UDP)
+                uint32_t tlen = ntohl(cmd_header.transfer_buffer_length);
+                if (tlen > 0 && ntohl(cmd_header.direction) == 0) {
+                    uint8_t* dummy = new uint8_t[tlen];
+                    recv_all(client_fd, dummy, tlen);
+                    delete[] dummy;
+                }
+                continue;
+            }
+
             uint32_t ep = ntohl(cmd_header.ep) & 0x7F;
             uint32_t dir = ntohl(cmd_header.direction);
             uint32_t transfer_len = ntohl(cmd_header.transfer_buffer_length);
 
             if (command == USBIP_CMD_SUBMIT) {
+                // Check for device FD update before submitting (Shared lock)
+                {
+                    std::shared_lock<std::shared_mutex> lock(g_devices_rw_mutex);
+                    if (g_active_devices.count(current_busid) && g_active_devices[current_busid] != -1 && g_active_devices[current_busid] != device_fd) {
+                        device_fd = g_active_devices[current_busid];
+                    }
+                }
+
                 auto *ctx = (async_urb_context *)calloc(1, sizeof(async_urb_context));
                 if (!ctx) break;
                 ctx->client_fd = client_fd;
+                ctx->udp_fd = -1; // TCP path
                 ctx->seqnum = cmd_header.seqnum;
                 ctx->devid = cmd_header.devid;
                 ctx->direction = cmd_header.direction;
@@ -513,9 +831,15 @@ void handle_client(int client_fd, int device_fd) {
                 ctx->urb.endpoint = (unsigned char)(ep | (dir == 1 ? 0x80 : 0));
 
                 if (ep == 0) {
-                    uint8_t bRequest = cmd_header.setup[1];
+                    uint8_t bmRequestType = cmd_header.setup[0];
+                    uint8_t bRequest      = cmd_header.setup[1];
                     uint16_t wValue = (uint16_t)(cmd_header.setup[2] | (cmd_header.setup[3] << 8));
                     uint16_t wIndex = (uint16_t)(cmd_header.setup[4] | (cmd_header.setup[5] << 8));
+                    uint16_t wLength = (uint16_t)transfer_len;
+
+                    LOGI("TCP EP0 Control Request: bmRequestType=0x%02x, bRequest=0x%02x, wValue=0x%04x, wIndex=0x%04x, wLength=%u",
+                         bmRequestType, bRequest, wValue, wIndex, wLength);
+
                     if (cmd_header.setup[0] == 0x00 && bRequest == 0x09) {
                         for (int i = 0; i < 16; i++) { int intf = i; ioctl(device_fd, USBDEVFS_RELEASEINTERFACE, &intf); }
                         unsigned int config_val = wValue;
@@ -612,6 +936,11 @@ void run_server(int device_fd_raw) {
             continue;
         }
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+        int buf_size = 2 * 1024 * 1024; // 2MB
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+
         set_keepalive(client_fd);
         { std::lock_guard<std::mutex> lock(g_clients_mutex); g_client_sockets.push_back(client_fd); }
         sessions.emplace_back([client_fd]() {
