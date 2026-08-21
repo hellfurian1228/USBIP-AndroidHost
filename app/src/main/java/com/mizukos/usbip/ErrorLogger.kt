@@ -27,6 +27,10 @@ object ErrorLogger {
         onLogCallback?.invoke(message)
     }
 
+    fun getLogs(): String {
+        return logBuffer.joinToString("\n\n")
+    }
+
     fun copyLogsToClipboard(context: Context) {
         val report = StringBuilder()
         report.append("--- USB/IP Support Report ---\n")

@@ -16,6 +16,7 @@ import android.util.Log
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.net.wifi.WifiManager
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -39,6 +40,7 @@ class UsbServerService : Service() {
     private val nativeServerMutex = Mutex()
     private var busIdCounter = 1
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     private val binder = LocalBinder()
 
@@ -52,6 +54,7 @@ class UsbServerService : Service() {
     private val NOTIFICATION_ID = 1
     private lateinit var usbManager: UsbManager
     private var isNativeServerStarted = false
+    private lateinit var usbipNsdManager: UsbipNsdManager
 
     private val ACTION_USB_PERMISSION_SERVICE = "com.mizukos.usbip.USB_PERMISSION_SERVICE"
 
@@ -587,11 +590,18 @@ class UsbServerService : Service() {
         super.onCreate()
         android.util.Log.i("UsbServerService", "Service onCreate")
         usbManager = getSystemService(USB_SERVICE) as UsbManager
+        usbipNsdManager = UsbipNsdManager(this)
         
         // Acquire WakeLock to keep CPU running when screen is off
         val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UsbIpServer:WakeLock").apply {
-            acquire(10 * 60 * 1000L /* 10 minutes timeout for OS safety */)
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UsbIp:WakeLock").apply {
+            acquire()
+        }
+
+        // Acquire WifiLock for high performance
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "UsbIpWifiLock").apply {
+            acquire()
         }
 
         createNotificationChannel()
@@ -626,6 +636,7 @@ class UsbServerService : Service() {
                     android.util.Log.i("UsbServerService", "Starting persistent native server daemon")
                     startNativeServer(-1) // Start as daemon without initial device
                     isNativeServerStarted = true
+                    usbipNsdManager.registerService(3240)
                 }
             }
 
@@ -658,7 +669,13 @@ class UsbServerService : Service() {
         }
         wakeLock = null
 
+        wifiLock?.let {
+            if (it.isHeld) it.release()
+        }
+        wifiLock = null
+
         stopNativeServer()
+        usbipNsdManager.unregisterService()
         openedDevices.values.forEach { it.connection.close() }
         openedDevices.clear()
         _deviceList.value = emptyMap()

@@ -5,7 +5,7 @@
     <string name="port_label">Port: 3240</string>
     <string name="devices_header">Available Devices</string>
     <string name="no_devices">No USB devices detected</string>
-    <string name="copy_logs">Copy Support Logs</string>
+    <string name="view_logs">View Debug Logs</string>
     <string name="connect">Connect</string>
     <string name="disconnect">Disconnect</string>
     <string name="status_connected">Connected active device(s)</string>

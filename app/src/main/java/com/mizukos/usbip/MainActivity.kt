@@ -114,16 +114,30 @@ class MainActivity : ComponentActivity() {
         tvLogStatus = findViewById(R.id.tv_log_status)
         rvDevices = findViewById(R.id.rv_devices)
         tvEmptyState = findViewById(R.id.tv_empty_state)
-        val btnCopyLogs: Button = findViewById(R.id.btn_copy_logs)
+        val btnViewLogs: Button = findViewById(R.id.btn_view_logs)
         btnRefresh = findViewById(R.id.btn_refresh)
 
         btnRefresh.setOnClickListener {
             lifecycleScope.launch { viewModel.refreshDevices() }
         }
 
-        btnCopyLogs.setOnClickListener {
-            ErrorLogger.copyLogsToClipboard(this)
+        btnViewLogs.setOnClickListener {
+            showDebugLogsDialog()
         }
+    }
+
+    private fun showDebugLogsDialog() {
+        val logs = ErrorLogger.getLogs()
+        val message = if (logs.isEmpty()) "No debug logs captured yet." else logs
+        
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Debug Logs")
+            .setMessage(message)
+            .setPositiveButton("Close", null)
+            .setNeutralButton("Copy") { _, _ ->
+                ErrorLogger.copyLogsToClipboard(this)
+            }
+            .show()
     }
 
     private fun setupViewModel() {
