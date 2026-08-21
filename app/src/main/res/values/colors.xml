@@ -6,6 +6,9 @@
     <color name="colorTextPrimary">#FFFFFF</color>
     <color name="colorTextSecondary">#A0A5B5</color>
 
+    <!-- App Launcher Adaptive Icon Background -->
+    <color name="ic_launcher_background">#1A1D24</color>
+
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
     <color name="red">#FF4444</color>

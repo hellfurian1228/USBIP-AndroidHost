@@ -586,22 +586,73 @@ class UsbServerService : Service() {
         performComprehensiveCleanup(busId, device.deviceId)
     }
 
+    private var activePerformanceSessions = 0
+
+    @Synchronized
+    fun acquirePerformanceLocks() {
+        activePerformanceSessions++
+        if (activePerformanceSessions == 1) {
+            Log.i("UsbServerService", "First session active. Acquiring performance locks.")
+            wakeLock?.let {
+                if (!it.isHeld) it.acquire()
+            }
+            wifiLock?.let {
+                if (!it.isHeld) it.acquire()
+            }
+        }
+    }
+
+    @Synchronized
+    fun releasePerformanceLocks() {
+        if (activePerformanceSessions > 0) {
+            activePerformanceSessions--
+            if (activePerformanceSessions == 0) {
+                Log.i("UsbServerService", "All sessions finished. Releasing performance locks.")
+                wakeLock?.let {
+                    if (it.isHeld) it.release()
+                }
+                wifiLock?.let {
+                    if (it.isHeld) it.release()
+                }
+            }
+        }
+    }
+
+    private fun forceReleasePerformanceLocks() {
+        Log.i("UsbServerService", "Forcing performance locks release.")
+        activePerformanceSessions = 0
+        wakeLock?.let {
+            if (it.isHeld) it.release()
+        }
+        wifiLock?.let {
+            if (it.isHeld) it.release()
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         Log.i("UsbServerService", "Service onCreate")
         usbManager = getSystemService(USB_SERVICE) as UsbManager
         usbipNsdManager = UsbipNsdManager(this)
         
-        // Acquire WakeLock to keep CPU running when screen is off
+        // Initialize locks but do not acquire them yet
         val powerManager = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UsbIp:WakeLock").apply {
-            acquire()
+            setReferenceCounted(false)
         }
 
-        // Acquire WifiLock for high performance
+        // Initialize WifiLock for high performance and low latency
         val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-        wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "UsbIpWifiLock").apply {
-            acquire()
+        val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // API 29+: Use Low Latency mode to prevent PS-Poll throttling
+            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+        } else {
+            // Legacy fallback
+            @Suppress("DEPRECATION")
+            WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        }
+        wifiLock = wifiManager.createWifiLock(lockMode, "OmniStream:WifiLock").apply {
+            setReferenceCounted(false)
         }
 
         createNotificationChannel()
@@ -669,14 +720,8 @@ class UsbServerService : Service() {
         Log.i("UsbServerService", "Service onDestroy")
         unregisterReceiver(usbReceiver)
         
-        wakeLock?.let {
-            if (it.isHeld) it.release()
-        }
+        forceReleasePerformanceLocks()
         wakeLock = null
-
-        wifiLock?.let {
-            if (it.isHeld) it.release()
-        }
         wifiLock = null
 
         stopNativeServer()
@@ -703,6 +748,8 @@ class UsbServerService : Service() {
             .setContentTitle("USB/IP Server")
             .setContentText("Server is running in the background")
             .setSmallIcon(android.R.drawable.ic_menu_share) // Using a system icon for now
+            .setOngoing(true)
+            .setCategory(Notification.CATEGORY_SERVICE)
             .build()
     }
 
