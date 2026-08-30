@@ -33,6 +33,7 @@ import java.nio.ByteOrder
 import java.util.LinkedList
 import java.util.Queue
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.time.Duration.Companion.seconds
 
 class UsbServerService : Service() {
 
@@ -50,13 +51,9 @@ class UsbServerService : Service() {
 
     override fun onBind(intent: Intent?): IBinder = binder
 
-    private val CHANNEL_ID = "UsbServerChannel"
-    private val NOTIFICATION_ID = 1
     private lateinit var usbManager: UsbManager
     private var isNativeServerStarted = false
     private lateinit var usbipNsdManager: UsbipNsdManager
-
-    private val ACTION_USB_PERMISSION_SERVICE = "com.mizukos.usbip.USB_PERMISSION_SERVICE"
 
     data class DeviceHandle(
         val device: UsbDevice,
@@ -68,6 +65,7 @@ class UsbServerService : Service() {
     enum class SpecialDeviceProfile {
         LOGITECH_G29,
         ETHERNET,
+        STEAM_CONTROLLER, // Add this profile
         GENERIC
     }
 
@@ -100,11 +98,34 @@ class UsbServerService : Service() {
     private var isRequestingPermission = false
 
     // JNI accessors (Now querying the map)
+    @Suppress("unused")
     fun getVidForBusId(busId: String): Int = openedDevices[busId]?.device?.vendorId ?: 0
+    @Suppress("unused")
     fun getPidForBusId(busId: String): Int = openedDevices[busId]?.device?.productId ?: 0
+    @Suppress("unused")
     fun getInterfaceCountForBusId(busId: String): Int = openedDevices[busId]?.device?.interfaceCount ?: 0
     
+    @Suppress("unused")
     fun getFdForBusId(busId: String): Int = openedDevices[busId]?.connection?.fileDescriptor ?: -1
+
+    @Suppress("unused")
+    fun getSpeedForBusId(busId: String): Int {
+        val device = openedDevices[busId]?.device ?: return 3
+        if (Build.VERSION.SDK_INT >= 31) {
+            try {
+                val s = device.javaClass.getMethod("getSpeed").invoke(device) as Int
+                return when (s) {
+                    1 -> 1 // LOW
+                    2 -> 2 // FULL
+                    3 -> 3 // HIGH
+                    4 -> 5 // SUPER
+                    5 -> 5 // SUPER_PLUS
+                    else -> 3
+                }
+            } catch (_: Exception) { }
+        }
+        return 3
+    }
 
     fun connectDeviceManually(device: UsbDevice) {
         val busId = getBusId(device)
@@ -143,8 +164,8 @@ class UsbServerService : Service() {
         val handle = openedDevices.remove(busId)
         try {
             handle?.connection?.close()
-        } catch (e: Exception) {
-            Log.e("UsbServerService", "Error closing connection: ${e.message}")
+        } catch (_: Exception) {
+            // Error already logged by higher level or connection is already dead
         }
         
         // 3. Purge session trackers
@@ -155,9 +176,10 @@ class UsbServerService : Service() {
     }
 
     /**
-     * Build a raw USB/IP OP_REP_DEVLIST body (ndev + devices + interfaces)
+     * Build a raw USB/IP OP_REP_DEVLIST body (number of devices + devices + interfaces)
      * Queries UsbManager directly to ensure no ghost entries or stale metadata.
      */
+    @Suppress("unused")
     fun getExportedDevicesPayload(): ByteArray {
         val currentHardware = usbManager.deviceList.values
         // Real-time synchronization: filter hardware by active/authorized handles
@@ -169,7 +191,7 @@ class UsbServerService : Service() {
             return ByteBuffer.allocate(4).apply { putInt(0) }.array()
         }
 
-        // Calculate dynamic buffer size: 4 (ndev) + sum(312 + supported_intf_count * 4)
+        // Calculate dynamic buffer size: 4 (number of devices) + sum(312 + supported_interface_count * 4)
         val totalSize = 4 + exported.sumOf { dev ->
             val supportedCount = (0 until dev.interfaceCount)
                 .map { dev.getInterface(it) }
@@ -193,13 +215,13 @@ class UsbServerService : Service() {
             buffer.put(pathBytes, 0, minOf(pathBytes.size, 256))
             buffer.position(startPos + 256)
 
-            // busid (32 bytes) - Padded
+            // busId (32 bytes) - Padded
             val bIdBytes = busId.toByteArray()
             buffer.put(bIdBytes, 0, minOf(bIdBytes.size, 32))
             buffer.position(startPos + 256 + 32)
 
-            buffer.putInt(1) // busnum
-            buffer.putInt(device.deviceId) // devnum (transient ID)
+            buffer.putInt(1) // bus number
+            buffer.putInt(device.deviceId) // device number (transient ID)
             
             // Speed reporting (USBIP values: 1=Low, 2=Full, 3=High, 5=Super)
             // Use reflection for getSpeed() to support API 31+ while compiling against older SDKs if needed
@@ -240,15 +262,15 @@ class UsbServerService : Service() {
 
             // Interface Descriptors (4 bytes each)
             for (i in 0 until intfCount) {
-                val intf = supportedInterfaces[i]
-                buffer.put(intf.interfaceClass.toByte())
-                buffer.put(intf.interfaceSubclass.toByte())
-                buffer.put(intf.interfaceProtocol.toByte())
+                val interfaceDescriptor = supportedInterfaces[i]
+                buffer.put(interfaceDescriptor.interfaceClass.toByte())
+                buffer.put(interfaceDescriptor.interfaceSubclass.toByte())
+                buffer.put(interfaceDescriptor.interfaceProtocol.toByte())
                 buffer.put(0.toByte()) // padding
             }
         }
 
-        Log.i("UsbServerService", "Generated dynamic DEVLIST payload for ${exported.size} device(s)")
+        Log.i("UsbServerService", "Generated dynamic Device List payload for ${exported.size} device(s)")
         return buffer.array()
     }
 
@@ -311,12 +333,18 @@ class UsbServerService : Service() {
 
     private fun getDeviceProfile(device: UsbDevice): SpecialDeviceProfile {
         val vid = device.vendorId
-        
+        val pid = device.productId
+
+        // Valve Steam Controller (Wired or Dongle)
+        if (vid == 0x28DE && (pid == 0x1302 || pid == 0x1304)) {
+            return SpecialDeviceProfile.STEAM_CONTROLLER
+        }
+
         // Logitech (0x046D)
         if (vid == 0x046D) {
             return SpecialDeviceProfile.LOGITECH_G29
         }
-        
+
         // Ethernet / CDC Network - Class 0x02 (Communications) or 0xFF (Vendor Specific)
         if (device.deviceClass == 0x02 || device.deviceClass == 0xFF) {
             for (i in 0 until device.interfaceCount) {
@@ -324,7 +352,7 @@ class UsbServerService : Service() {
                 if (intf.interfaceClass == 0x02 || intf.interfaceClass == 0x0A) return SpecialDeviceProfile.ETHERNET
             }
         }
-        
+
         return SpecialDeviceProfile.GENERIC
     }
 
@@ -349,21 +377,50 @@ class UsbServerService : Service() {
     private fun handleIncomingDevice(device: UsbDevice) {
         val profile = getDeviceProfile(device)
         val busId = getBusId(device)
-        
+
         // 1. Session State Guard: Prevent duplicate port bindings or ghost sessions
         if (activeDeviceIdTracker.containsKey(device.deviceId)) {
             Log.i("UsbServerService", "Session Guard: Device ${device.deviceId} is already active. Ignoring duplicate request.")
             return
         }
-        
+
         // Prevent multiple simultaneous connection attempts for the same discovery ID
         if (pendingConnections.containsKey(busId)) {
             Log.i("UsbServerService", "Session Guard: Device on bus $busId is already in pending state.")
             return
         }
 
-        Log.i("UsbServerService", "Incoming USB: ${device.deviceName} (VID=${device.vendorId}, PID=${device.productId}) -> Profile: $profile")
-        
+        // Fetch the actual speed dynamically from Android (API 31+)
+        var speedStr = "UNKNOWN / PRE-API 31"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                val speedInt = device.javaClass.getMethod("getSpeed").invoke(device) as Int
+                speedStr = when (speedInt) {
+                    0 -> "UNKNOWN (0)"
+                    1 -> "LOW_SPEED (1) - 1.5 Mbps"
+                    2 -> "FULL_SPEED (2) - 12 Mbps"
+                    3 -> "HIGH_SPEED (3) - 480 Mbps"
+                    4 -> "SUPER_SPEED (4) - 5 Gbps"
+                    5 -> "SUPER_SPEED_PLUS (5) - 10 Gbps / 20 Gbps"
+                    else -> "UNMAPPED ($speedInt)"
+                }
+            } catch (_: Exception) {
+                speedStr = "ERROR_FETCHING_SPEED"
+            }
+        }
+
+        Log.i("UsbServerService", "Incoming USB: ${device.deviceName} (VID=${device.vendorId}, PID=${device.productId}) -> Profile: $profile | Speed: $speedStr")
+
+        // Steam Controller firmware warning check
+        if (profile == SpecialDeviceProfile.STEAM_CONTROLLER) {
+            val warning = "Steam Controller Detected. Ensure 2026 firmware is installed for standard gamepad support."
+            Log.w("UsbServerService", warning)
+            ErrorLogger.log(warning)
+            serviceScope.launch(Dispatchers.Main) {
+                Toast.makeText(applicationContext, warning, Toast.LENGTH_LONG).show()
+            }
+        }
+
         // 2. Validate device for unsupported characteristics
         if (!isDeviceSupported(device)) {
             Log.w("UsbServerService", "Aborting connection: No supported interfaces found on device.")
@@ -377,10 +434,10 @@ class UsbServerService : Service() {
         if (usbManager.hasPermission(device)) {
             pendingConnections[busId] = device.deviceId
             updateUiState()
-            
+
             // Cancel any previous job for this busId to avoid race conditions
             deviceJobs.remove(busId)?.cancel()
-            
+
             val job = serviceScope.launch {
                 attachDevice(device)
             }
@@ -436,7 +493,7 @@ class UsbServerService : Service() {
         
         // Safety timeout for permission dialog
         serviceScope.launch {
-            delay(30000L) // 30 seconds
+            delay(30.seconds)
             if (isRequestingPermission) {
                 isRequestingPermission = false
                 Log.w("UsbServerService", "Permission request timed out for ${device.deviceName}")
@@ -589,12 +646,13 @@ class UsbServerService : Service() {
     private var activePerformanceSessions = 0
 
     @Synchronized
+    @Suppress("unused")
     fun acquirePerformanceLocks() {
         activePerformanceSessions++
         if (activePerformanceSessions == 1) {
             Log.i("UsbServerService", "First session active. Acquiring performance locks.")
             wakeLock?.let {
-                if (!it.isHeld) it.acquire()
+                if (!it.isHeld) it.acquire(24 * 60 * 60 * 1000L) // 24-hour safety timeout
             }
             wifiLock?.let {
                 if (!it.isHeld) it.acquire()
@@ -603,6 +661,7 @@ class UsbServerService : Service() {
     }
 
     @Synchronized
+    @Suppress("unused")
     fun releasePerformanceLocks() {
         if (activePerformanceSessions > 0) {
             activePerformanceSessions--
@@ -762,6 +821,10 @@ class UsbServerService : Service() {
     private external fun invalidateDeviceFd(busId: String)
 
     companion object {
+        private const val CHANNEL_ID = "UsbServerChannel"
+        private const val NOTIFICATION_ID = 1
+        private const val ACTION_USB_PERMISSION_SERVICE = "com.mizukos.usbip.USB_PERMISSION_SERVICE"
+
         init {
             System.loadLibrary("usbip_server")
         }

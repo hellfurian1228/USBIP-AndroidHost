@@ -96,7 +96,6 @@ class UsbDeviceViewModel(private val usbManager: UsbManager) : ViewModel() {
             context.applicationContext.unbindService(serviceConnection)
             isBound = false
         } catch (e: Exception) {
-            // Ignore if already unbound
         }
     }
 
@@ -108,7 +107,7 @@ class UsbDeviceViewModel(private val usbManager: UsbManager) : ViewModel() {
                 isInitialized.complete(Unit)
             } catch (e: Exception) {
                 android.util.Log.e("UsbDeviceViewModel", "Init failed: ${e.message}")
-                isInitialized.complete(Unit) // Unblock regardless
+                isInitialized.complete(Unit)
             }
             
             // Keep UI state in sync with devices flow
@@ -125,13 +124,18 @@ class UsbDeviceViewModel(private val usbManager: UsbManager) : ViewModel() {
     suspend fun refreshDevices() = withContext(Dispatchers.IO) {
         val deviceList = usbManager.deviceList
         val infoList = deviceList.values.map { device ->
-            val name = device.productName ?: "USB Device [${String.format("0x%04x", device.vendorId)}:${String.format("0x%04x", device.productId)}]"
-            
+
+            val name = if (device.vendorId == 0x28DE && (device.productId == 0x1302 || device.productId == 0x1304)) {
+                "Steam Controller"
+            } else {
+                device.productName ?: "USB Device [${String.format("0x%04x", device.vendorId)}:${String.format("0x%04x", device.productId)}]"
+            }
+
             UsbDeviceInfo(
                 deviceName = name,
                 deviceId = device.deviceId,
                 devicePath = device.deviceName,
-                connectionState = ConnectionState.DISCONNECTED // Will be mapped in 'devices' flow
+                connectionState = ConnectionState.DISCONNECTED
             )
         }
         _availableDevices.value = infoList

@@ -42,8 +42,8 @@ class UsbipNsdManager(context: Context) {
                     @Suppress("DEPRECATION")
                     host = address
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to set host IP: ${e.message}")
+            } catch (_: Exception) {
+                Log.e(TAG, "Failed to set host IP")
             }
         }
 
@@ -70,21 +70,21 @@ class UsbipNsdManager(context: Context) {
 
         try {
             nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener)
-        } catch (e: Exception) {
-            Log.e(TAG, "Exception during service registration: ${e.message}")
+        } catch (_: Exception) {
+            Log.e(TAG, "Exception during service registration")
             registrationListener = null
         }
     }
 
     /**
-     * Unregisters the USBIP service from the local network.
+     * Unregisters the USB/IP service from the local network.
      */
     fun unregisterService() {
         registrationListener?.let {
             try {
                 nsdManager.unregisterService(it)
-            } catch (e: Exception) {
-                Log.e(TAG, "Exception during service unregistration: ${e.message}")
+            } catch (_: Exception) {
+                Log.e(TAG, "Exception during service unregistration")
             }
             registrationListener = null
             registeredServiceInfo = null

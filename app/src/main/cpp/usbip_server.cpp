@@ -62,11 +62,11 @@ int get_int_for_busid(const char* method_name, const std::string& busid) {
     JNIEnv* env;
     bool attached = false;
     if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
-        #ifdef __ANDROID__
-            g_jvm->AttachCurrentThread(&env, nullptr);
-        #else
-            g_jvm->AttachCurrentThread((void**)&env, nullptr);
-        #endif
+#ifdef __ANDROID__
+        g_jvm->AttachCurrentThread(&env, nullptr);
+#else
+        g_jvm->AttachCurrentThread((void**)&env, nullptr);
+#endif
         attached = true;
     }
     jclass cls = env->GetObjectClass(g_service_obj);
@@ -83,11 +83,11 @@ void notify_performance_locks(bool acquire) {
     JNIEnv* env;
     bool attached = false;
     if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
-        #ifdef __ANDROID__
-            g_jvm->AttachCurrentThread(&env, nullptr);
-        #else
-            g_jvm->AttachCurrentThread((void**)&env, nullptr);
-        #endif
+#ifdef __ANDROID__
+        g_jvm->AttachCurrentThread(&env, nullptr);
+#else
+        g_jvm->AttachCurrentThread((void**)&env, nullptr);
+#endif
         attached = true;
     }
     jclass cls = env->GetObjectClass(g_service_obj);
@@ -234,7 +234,7 @@ struct session_context {
     std::condition_variable tx_cv;
 
     session_context(int fd, std::shared_ptr<std::atomic<bool>> conn)
-        : client_fd(fd), is_connected(conn) {}
+            : client_fd(fd), is_connected(conn) {}
 };
 
 void tcp_tx_thread(std::shared_ptr<session_context> ctx) {
@@ -385,26 +385,70 @@ void reap_thread(std::string busid, int device_fd, std::shared_ptr<session_conte
         if (ntohl(ctx->ep) == 0) {
             LOGI("<<< USBIP_RET_SUBMIT (EP0): seq=%u, status=%d, actual_len=%u, bus=%s",
                  ntohl(ctx->seqnum), (int32_t)ntohl(ret.status), (uint32_t)ntohl(ret.actual_length), busid.c_str());
+
+            // --- USB 3.0 TO USB 2.0 DESCRIPTOR DOWNGRADE PATCH ---
+            if (urb->actual_length > 0 && ntohl(ctx->direction) == 1 && ctx->urb.type == USBDEVFS_URB_TYPE_CONTROL) {
+                uint8_t* setup = ctx->payload_buffer;
+                uint8_t* data_ptr = ctx->payload_buffer + 8;
+
+                if (setup[0] == 0x80 && setup[1] == 0x06) { // GET_DESCRIPTOR
+                    uint8_t desc_type = setup[3];
+
+                    if (desc_type == 0x01 && urb->actual_length >= 18) {
+                        // 1. Patch Device Descriptor
+                        data_ptr[2] = 0x00;
+                        data_ptr[3] = 0x02; // Force to 2.00
+
+                        // FIX: USB 3.0 sets this to 0x09. USB 2.0 strictly expects 64 (0x40).
+                        if (data_ptr[7] == 0x09 || data_ptr[7] > 64) {
+                            data_ptr[7] = 64;
+                        }
+
+                        LOGI("Downgraded Device Descriptor to USB 2.0 for Windows compatibility");
+
+                    } else if (desc_type == 0x02 && urb->actual_length >= 9) {
+                        // 2. Patch Configuration Descriptor (Iterate through endpoints)
+                        int pos = 0;
+                        while (pos + 1 < urb->actual_length) {
+                            uint8_t d_len = data_ptr[pos];
+                            if (d_len < 2 || pos + d_len > urb->actual_length) break;
+
+                            uint8_t d_type = data_ptr[pos + 1];
+                            if (d_type == 0x05 && d_len >= 7) { // Endpoint Descriptor
+                                uint16_t wMax = data_ptr[pos + 4] | (data_ptr[pos + 5] << 8);
+                                // Cap SuperSpeed bulk endpoints (1024 bytes) to High Speed limits (512 bytes)
+                                if (wMax > 512) {
+                                    data_ptr[pos + 4] = 0x00;
+                                    data_ptr[pos + 5] = 0x02;
+                                }
+                            }
+                            pos += d_len;
+                        }
+                        LOGI("Downgraded Configuration Descriptor endpoints to USB 2.0");
+                    }
+                }
+            }
+            // -----------------------------------------------------
         }
 
         if (is_connected->load()) {
             if (ctx->udp_fd != -1) {
-            // UDP path remains direct (low latency)
-            uint8_t out_buf[65536 + 64];
-            uint32_t seq_net = htonl(ctx->udp_seq_id);
-            memcpy(out_buf, &seq_net, 4);
-            memcpy(out_buf + 4, &ret, sizeof(ret));
-            size_t out_len = 4 + sizeof(ret);
+                // UDP path remains direct (low latency)
+                uint8_t out_buf[65536 + 64];
+                uint32_t seq_net = htonl(ctx->udp_seq_id);
+                memcpy(out_buf, &seq_net, 4);
+                memcpy(out_buf + 4, &ret, sizeof(ret));
+                size_t out_len = 4 + sizeof(ret);
 
-            if (urb->actual_length > 0 && ntohl(ctx->direction) == 1) {
-                uint8_t* data_ptr = ctx->payload_buffer;
-                if (ctx->urb.type == USBDEVFS_URB_TYPE_CONTROL) data_ptr += 8;
-                memcpy(out_buf + out_len, data_ptr, urb->actual_length);
-                out_len += urb->actual_length;
-            }
-            struct sockaddr_in client_addr = ctx->client_addr;
-            sendto(ctx->udp_fd, out_buf, out_len, 0, (struct sockaddr*)&client_addr, sizeof(client_addr));
-        } else {
+                if (urb->actual_length > 0 && ntohl(ctx->direction) == 1) {
+                    uint8_t* data_ptr = ctx->payload_buffer;
+                    if (ctx->urb.type == USBDEVFS_URB_TYPE_CONTROL) data_ptr += 8;
+                    memcpy(out_buf + out_len, data_ptr, urb->actual_length);
+                    out_len += urb->actual_length;
+                }
+                struct sockaddr_in client_addr = ctx->client_addr;
+                sendto(ctx->udp_fd, out_buf, out_len, 0, (struct sockaddr*)&client_addr, sizeof(client_addr));
+            } else {
                 // TCP path now decoupled via TX Queue
                 tx_packet* pkt = new tx_packet();
                 pkt->header = ret;
@@ -459,7 +503,11 @@ void get_device_info(int device_fd, struct usbip_usb_device *dev, std::vector<st
     strncpy(dev->busid, busid, sizeof(dev->busid) - 1);
     dev->busnum = htonl(1);
     dev->devnum = htonl(2);
-    dev->speed = htonl(3);
+
+    // Fetch the actual speed dynamically from Android
+    std::string s_busid(busid);
+    int real_speed = get_int_for_busid("getSpeedForBusId", s_busid);
+    dev->speed = (real_speed > 0) ? htonl((uint32_t)real_speed) : htonl(3);
 
     if (device_fd == -1 || ioctl(device_fd, USBDEVFS_CONTROL, &ctrl) < 0) {
         std::string s_busid(busid);
@@ -638,24 +686,26 @@ void udp_worker_loop(int udp_fd, int device_fd, std::vector<endpoint_info> eps, 
                 LOGI("UDP EP0 Control Request: bmRequestType=0x%02x, bRequest=0x%02x, wValue=0x%04x, wIndex=0x%04x, wLength=%u",
                      bmRequestType, bRequest, wValue, wIndex, wLength);
 
-                if (bmRequestType == 0x00 && bRequest == 0x09) { // SET_CONFIGURATION
-                    LOGI("UDP: Intercepted SET_CONFIGURATION");
-                    for (int i = 0; i < 16; i++) { int intf = i; ioctl(device_fd, USBDEVFS_RELEASEINTERFACE, &intf); }
-                    unsigned int config_val = wValue;
-                    int res_sc = ioctl(device_fd, USBDEVFS_SETCONFIGURATION, &config_val);
-                    for (int i = 0; i < 16; i++) { int intf = i; ioctl(device_fd, USBDEVFS_CLAIMINTERFACE, &intf); }
+                if (header->setup[0] == 0x00 && bRequest == 0x09) {
+                    LOGI("UDP: Intercepted SET_CONFIGURATION - Faking success to client");
 
                     struct usbip_ret_submit ret = {0};
                     ret.command = htonl(USBIP_RET_SUBMIT);
-                    ret.seqnum = ctx->seqnum; ret.devid = ctx->devid; ret.direction = ctx->direction; ret.ep = ctx->ep;
-                    ret.status = (res_sc < 0) ? htonl((uint32_t)-errno) : 0;
+                    ret.seqnum = ctx->seqnum;
+                    ret.devid = ctx->devid;
+                    ret.direction = ctx->direction;
+                    ret.ep = ctx->ep;
+                    ret.status = 0;
 
                     uint8_t out_buf[52];
                     uint32_t s_net = htonl(udp_seq_id);
                     memcpy(out_buf, &s_net, 4);
                     memcpy(out_buf + 4, &ret, sizeof(ret));
                     sendto(udp_fd, out_buf, 52, 0, (struct sockaddr*)&from_addr, sizeof(from_addr));
-                    delete[] ctx->payload_buffer; free(ctx); continue;
+
+                    delete[] ctx->payload_buffer;
+                    free(ctx);
+                    continue;
                 } else if (bmRequestType == 0x01 && bRequest == 0x0B) { // SET_INTERFACE
                     LOGI("UDP: Intercepted SET_INTERFACE");
                     struct usbdevfs_setinterface setintf = {0};
@@ -688,7 +738,30 @@ void udp_worker_loop(int udp_fd, int device_fd, std::vector<endpoint_info> eps, 
                 } else if (bmRequestType == 0x02 && bRequest == 0x01 && wValue == 0x0000) { // CLEAR_FEATURE
                     uint32_t target_endpoint = wIndex & 0xFF;
                     LOGI("UDP: Intercepted CLEAR_FEATURE (ENDPOINT_HALT) for ep 0x%02x", target_endpoint);
-                    ioctl(device_fd, USBDEVFS_CLEAR_HALT, &target_endpoint);
+
+                    int res_cf = ioctl(device_fd, USBDEVFS_CLEAR_HALT, &target_endpoint);
+                    if (res_cf < 0) {
+                        LOGW("USBDEVFS_CLEAR_HALT failed: %s", strerror(errno));
+                    }
+
+                    // Prevent fall-through by sending the response directly via UDP
+                    struct usbip_ret_submit ret = {0};
+                    ret.command = htonl(USBIP_RET_SUBMIT);
+                    ret.seqnum = ctx->seqnum;
+                    ret.devid = ctx->devid;
+                    ret.direction = ctx->direction;
+                    ret.ep = ctx->ep;
+                    ret.status = (res_cf < 0) ? htonl((uint32_t)-errno) : 0;
+
+                    uint8_t out_buf[52];
+                    uint32_t s_net = htonl(udp_seq_id);
+                    memcpy(out_buf, &s_net, 4);
+                    memcpy(out_buf + 4, &ret, sizeof(ret));
+                    sendto(udp_fd, out_buf, 52, 0, (struct sockaddr*)&from_addr, sizeof(from_addr));
+
+                    delete[] ctx->payload_buffer;
+                    free(ctx);
+                    continue;
                 }
             }
 
@@ -736,11 +809,11 @@ void handle_client(int client_fd, int device_fd) {
         JNIEnv* env;
         bool attached = false;
         if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
-            #ifdef __ANDROID__
-                g_jvm->AttachCurrentThread(&env, nullptr);
-            #else
-                g_jvm->AttachCurrentThread((void**)&env, nullptr);
-            #endif
+#ifdef __ANDROID__
+            g_jvm->AttachCurrentThread(&env, nullptr);
+#else
+            g_jvm->AttachCurrentThread((void**)&env, nullptr);
+#endif
             attached = true;
         }
         jclass cls = env->GetObjectClass(g_service_obj);
@@ -828,7 +901,6 @@ void handle_client(int client_fd, int device_fd) {
             std::lock_guard<std::mutex> lock(g_client_map_mutex);
             g_busid_to_client_fd[current_busid] = client_fd;
         }
-        ioctl(device_fd, USBDEVFS_RESET);
 
         struct usbip_usb_device dev = {0};
         std::vector<struct usbip_usb_interface> intfs;
@@ -954,14 +1026,16 @@ void handle_client(int client_fd, int device_fd) {
                          bmRequestType, bRequest, wValue, wIndex, wLength);
 
                     if (cmd_header.setup[0] == 0x00 && bRequest == 0x09) {
-                        for (int i = 0; i < 16; i++) { int intf = i; ioctl(device_fd, USBDEVFS_RELEASEINTERFACE, &intf); }
-                        unsigned int config_val = wValue;
-                        int res_sc = ioctl(device_fd, USBDEVFS_SETCONFIGURATION, &config_val);
-                        for (int i = 0; i < 16; i++) { int intf = i; ioctl(device_fd, USBDEVFS_CLAIMINTERFACE, &intf); }
+                        LOGI("TCP: Intercepted SET_CONFIGURATION - Faking success to client");
+
+                        // Create a successful response packet
                         struct usbip_ret_submit ret = {0};
                         ret.command = htonl(USBIP_RET_SUBMIT);
-                        ret.seqnum = ctx->seqnum; ret.devid = ctx->devid; ret.direction = ctx->direction; ret.ep = ctx->ep;
-                        ret.status = (res_sc < 0) ? htonl((uint32_t)-errno) : 0;
+                        ret.seqnum = ctx->seqnum;
+                        ret.devid = ctx->devid;
+                        ret.direction = ctx->direction;
+                        ret.ep = ctx->ep;
+                        ret.status = 0; // 0 indicates success to Windows
 
                         tx_packet* pkt = new tx_packet();
                         pkt->header = ret;
@@ -971,7 +1045,9 @@ void handle_client(int client_fd, int device_fd) {
                         }
                         session->tx_cv.notify_one();
 
-                        delete[] ctx->payload_buffer; free(ctx); continue;
+                        delete[] ctx->payload_buffer;
+                        free(ctx);
+                        continue;
                     } else if (cmd_header.setup[0] == 0x01 && bRequest == 0x0B) {
                         struct usbdevfs_setinterface setintf = {0};
                         setintf.interface = wIndex; setintf.altsetting = wValue;
@@ -1007,11 +1083,33 @@ void handle_client(int client_fd, int device_fd) {
                     } else if (cmd_header.setup[0] == 0x02 && bRequest == 0x01 && wValue == 0x0000) {
                         // CLEAR_FEATURE (ENDPOINT_HALT)
                         uint32_t target_endpoint = wIndex & 0xFF;
-                        LOGI("Intercepted CLEAR_FEATURE (ENDPOINT_HALT) for ep 0x%02x", target_endpoint);
-                        if (ioctl(device_fd, USBDEVFS_CLEAR_HALT, &target_endpoint) < 0) {
+                        LOGI("TCP: Intercepted CLEAR_FEATURE (ENDPOINT_HALT) for ep 0x%02x", target_endpoint);
+
+                        int res_cf = ioctl(device_fd, USBDEVFS_CLEAR_HALT, &target_endpoint);
+                        if (res_cf < 0) {
                             LOGW("USBDEVFS_CLEAR_HALT failed: %s", strerror(errno));
                         }
-                        // Allow to fall through to SUBMITURB so Windows gets response
+
+                        // Prevent fall-through by faking the response and continuing
+                        struct usbip_ret_submit ret = {0};
+                        ret.command = htonl(USBIP_RET_SUBMIT);
+                        ret.seqnum = ctx->seqnum;
+                        ret.devid = ctx->devid;
+                        ret.direction = ctx->direction;
+                        ret.ep = ctx->ep;
+                        ret.status = (res_cf < 0) ? htonl((uint32_t)-errno) : 0;
+
+                        tx_packet* pkt = new tx_packet();
+                        pkt->header = ret;
+                        {
+                            std::lock_guard<std::mutex> lock(session->tx_mutex);
+                            session->tx_queue.push(pkt);
+                        }
+                        session->tx_cv.notify_one();
+
+                        delete[] ctx->payload_buffer;
+                        free(ctx);
+                        continue;
                     }
                 }
 
