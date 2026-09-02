@@ -4,6 +4,13 @@
 [![Platform](https://img.shields.io/badge/Platform-Android-3DDC84.svg?style=flat-square&logo=android)](https://developer.android.com/about/dashboards)
 [![Donate](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=flat-square&logo=paypal)](https://www.paypal.com/donate/?hosted_button_id=P3P43EXYJWRLC)
 
+## ☕ Support the Project
+If you find this tool useful and want to support continued development, I utilize subscription based software for code. Donations will go towards this. Thanks!
+
+[**Donate via PayPal**](https://www.paypal.com/donate/?hosted_button_id=P3P43EXYJWRLC)
+
+## Discord https://discord.gg/R2nfbS4K2
+
 A streamlined Android implementation of the **USB/IP** protocol. This app transforms your Android device into a network-attached USB hub, allowing you to "tunnel" physical hardware—like racing wheels, pedals, and game controllers—directly to a remote Windows or Linux machine.
 
 ## 🕹️ Why this exists
@@ -29,11 +36,6 @@ Most USB/IP solutions require complex Linux setups or rooted devices. This proje
 *   On your PC, launch your USB/IP client.
 *   Input the Android device's IP and scan/attach the remote device.
 *   The peripheral will now behave as if it were plugged directly into your PC.
-
-## ☕ Support the Project
-If you find this tool useful and want to support continued development (especially for testing new hardware), feel free to buy me a coffee!
-
-[**Donate via PayPal**](https://www.paypal.com/donate/?hosted_button_id=P3P43EXYJWRLC)
 
 ## 🛠️ Tech Stack
 *   **Kotlin:** Modern, lifecycle-aware UI and service management.
