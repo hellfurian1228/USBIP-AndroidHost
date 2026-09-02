@@ -14,7 +14,7 @@ If you find this tool useful and want to support continued development, I utiliz
 
 ## USBIP-AndroidHost
 
-A streamlined Android implementation of the **USB/IP** protocol. This app transforms your Android device into a network-attached USB hub, allowing you to "tunnel" physical hardware—like racing wheels, pedals, and game controllers—directly to a remote Windows or Linux machine.
+A streamlined Android implementation of the **USB/IP** protocol. This app transforms your Android device into a network-attached USB hub, allowing you to "tunnel" physical hardware—like sim equipment, game controllers, 3D printers/scanners, and storage devices—directly to a remote Windows or Linux machine.
 
 ## 🕹️ Why this exists
 Most USB/IP solutions require complex Linux setups or rooted devices. This project aims to make the process accessible through a standard Android app, specifically tuned for low-latency peripherals like sim-racing gear.
