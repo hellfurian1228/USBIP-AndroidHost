@@ -37,6 +37,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var deviceAdapter: DeviceAdapter
 
     private lateinit var tvServerIp: TextView
+    private lateinit var tvAllNetworks: TextView
     private lateinit var tvServiceStatus: TextView
     private lateinit var tvLogStatus: TextView
     private lateinit var rvDevices: RecyclerView
@@ -110,12 +111,14 @@ class MainActivity : ComponentActivity() {
 
     private fun initViews() {
         tvServerIp = findViewById(R.id.tv_server_ip)
+        tvAllNetworks = findViewById(R.id.tv_all_networks)
         tvServiceStatus = findViewById(R.id.tv_service_status)
         tvLogStatus = findViewById(R.id.tv_log_status)
         rvDevices = findViewById(R.id.rv_devices)
         tvEmptyState = findViewById(R.id.tv_empty_state)
         val btnViewLogs: Button = findViewById(R.id.btn_view_logs)
         btnRefresh = findViewById(R.id.btn_refresh)
+        val statusCard: MaterialCardView = findViewById(R.id.status_card)
 
         btnRefresh.setOnClickListener {
             lifecycleScope.launch { viewModel.refreshDevices() }
@@ -123,6 +126,10 @@ class MainActivity : ComponentActivity() {
 
         btnViewLogs.setOnClickListener {
             showDebugLogsDialog()
+        }
+
+        statusCard.setOnClickListener {
+            showIpSelectionDialog()
         }
     }
 
@@ -137,6 +144,40 @@ class MainActivity : ComponentActivity() {
             .setNeutralButton("Copy") { _, _ ->
                 ErrorLogger.copyLogsToClipboard(this)
             }
+            .show()
+    }
+
+    private fun showIpSelectionDialog() {
+        val available = getAvailableIpAddresses()
+        val currentSelected = NetworkPreferences.getSelectedIp(this)
+
+        val items = mutableListOf<String>()
+        items.add("Automatic (Smart Default)")
+        available.forEach { ip ->
+            items.add("${ip.displayName} (${ip.address}) [${ip.interfaceName}]")
+        }
+
+        val checkedItem = if (currentSelected.isNullOrEmpty()) {
+            0
+        } else {
+            val index = available.indexOfFirst { it.address == currentSelected }
+            if (index >= 0) index + 1 else 0
+        }
+
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Select Server IP")
+            .setSingleChoiceItems(items.toTypedArray(), checkedItem) { dialog, which ->
+                if (which == 0) {
+                    viewModel.setSelectedIp(this, null)
+                    Toast.makeText(this, "Set to Automatic IP detection", Toast.LENGTH_SHORT).show()
+                } else {
+                    val selectedIp = available[which - 1].address
+                    viewModel.setSelectedIp(this, selectedIp)
+                    Toast.makeText(this, "Selected IP: $selectedIp", Toast.LENGTH_SHORT).show()
+                }
+                dialog.dismiss()
+            }
+            .setNegativeButton("Cancel", null)
             .show()
     }
 
@@ -207,6 +248,24 @@ class MainActivity : ComponentActivity() {
                 launch {
                     viewModel.deviceIp.collectLatest { ip ->
                         tvServerIp.text = getString(R.string.ip_label, ip)
+                    }
+                }
+                launch {
+                    viewModel.availableNetworks.collectLatest { networks ->
+                        if (networks.isNotEmpty()) {
+                            val currentIp = viewModel.deviceIp.value
+                            val text = buildString {
+                                append("Available Networks:\n")
+                                networks.forEach { net ->
+                                    val active = if (net.address == currentIp) " (Active/Broadcasted)" else ""
+                                    append("• ${net.displayName}: ${net.address}$active\n")
+                                }
+                            }.trim()
+                            tvAllNetworks.text = text
+                            tvAllNetworks.visibility = View.VISIBLE
+                        } else {
+                            tvAllNetworks.visibility = View.GONE
+                        }
                     }
                 }
                 launch {

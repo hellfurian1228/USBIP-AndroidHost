@@ -10,7 +10,7 @@ import java.net.InetAddress
  * Manages the mDNS service registration for the USBIP Host.
  * Broadcasts the presence of the USBIP server on the local network.
  */
-class UsbipNsdManager(context: Context) {
+class UsbipNsdManager(private val context: Context) {
 
     private val TAG = "UsbipNsdManager"
     private val SERVICE_TYPE = "_usbip._tcp"
@@ -35,7 +35,7 @@ class UsbipNsdManager(context: Context) {
             serviceType = SERVICE_TYPE
             setPort(port)
             try {
-                val address = InetAddress.getByName(getDeviceIpAddress())
+                val address = InetAddress.getByName(getDeviceIpAddress(context))
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     setHostAddresses(listOf(address))
                 } else {

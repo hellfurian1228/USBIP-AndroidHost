@@ -1152,7 +1152,7 @@ void handle_client(int client_fd, int device_fd) {
     notify_performance_locks(false);
 }
 
-void run_server(int device_fd_raw) {
+void run_server(int device_fd_raw, const char* server_ip_cstr) {
     int device_fd = (device_fd_raw != -1) ? dup(device_fd_raw) : -1;
     int server_fd, client_fd;
     struct sockaddr_in address = {0};
@@ -1167,10 +1167,23 @@ void run_server(int device_fd_raw) {
 
     { std::lock_guard<std::mutex> lock(g_socket_mutex); g_server_socket = server_fd; }
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
+    if (server_ip_cstr && strlen(server_ip_cstr) > 0 && strcmp(server_ip_cstr, "127.0.0.1") != 0) {
+        address.sin_addr.s_addr = inet_addr(server_ip_cstr);
+        LOGI("Server binding strictly to IP: %s", server_ip_cstr);
+    } else {
+        address.sin_addr.s_addr = INADDR_ANY;
+        LOGI("Server binding to INADDR_ANY (0.0.0.0)");
+    }
     address.sin_port = htons(USBIP_PORT);
 
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) { close(server_fd); return; }
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        LOGW("Failed to bind to specific IP %s, falling back to INADDR_ANY", server_ip_cstr ? server_ip_cstr : "NULL");
+        address.sin_addr.s_addr = INADDR_ANY;
+        if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+            close(server_fd);
+            return;
+        }
+    }
     if (listen(server_fd, 3) < 0) { close(server_fd); return; }
 
     std::vector<std::thread> sessions;
@@ -1203,15 +1216,23 @@ void run_server(int device_fd_raw) {
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_mizukos_usbip_UsbServerService_startNativeServer(JNIEnv *env, jobject thiz, jint device_fd) {
+Java_com_mizukos_usbip_UsbServerService_startNativeServer(JNIEnv *env, jobject thiz, jint device_fd, jstring jserver_ip) {
     signal(SIGPIPE, SIG_IGN);
     if (g_service_obj) env->DeleteGlobalRef(g_service_obj);
     g_service_obj = env->NewGlobalRef(thiz);
+
+    std::string server_ip = "";
+    if (jserver_ip) {
+        const char* ip_ptr = env->GetStringUTFChars(jserver_ip, nullptr);
+        server_ip = ip_ptr;
+        env->ReleaseStringUTFChars(jserver_ip, ip_ptr);
+    }
+
     std::lock_guard<std::mutex> lock(g_socket_mutex);
     if (g_server_socket >= 0) { shutdown(g_server_socket, SHUT_RDWR); close(g_server_socket); g_server_socket = -1; }
     { std::unique_lock<std::shared_mutex> dev_lock(g_devices_rw_mutex); if (device_fd != -1) g_active_devices["1-1"] = device_fd; }
     if (g_server_thread.joinable()) g_server_thread.join();
-    g_server_thread = std::thread(run_server, device_fd);
+    g_server_thread = std::thread(run_server, device_fd, server_ip.c_str());
 }
 
 extern "C" JNIEXPORT void JNICALL

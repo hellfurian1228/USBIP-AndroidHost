@@ -25,6 +25,9 @@ class UsbDeviceViewModel(private val usbManager: UsbManager) : ViewModel() {
     private val _deviceIp = MutableStateFlow("127.0.0.1")
     val deviceIp: StateFlow<String> = _deviceIp.asStateFlow()
 
+    private val _availableNetworks = MutableStateFlow<List<NetworkIp>>(emptyList())
+    val availableNetworks: StateFlow<List<NetworkIp>> = _availableNetworks.asStateFlow()
+
     private val _availableDevices = MutableStateFlow<List<UsbDeviceInfo>>(emptyList())
     private val exportedDevices = MutableStateFlow<Map<String, UsbServerService.DeviceInfo>>(emptyMap())
 
@@ -84,9 +87,51 @@ class UsbDeviceViewModel(private val usbManager: UsbManager) : ViewModel() {
             android.util.Log.e("UsbDeviceViewModel", "Failed to bind service: ${e.message}")
         }
         
-        // Load IP address
+        // Load IP address and available networks
         viewModelScope.launch(Dispatchers.IO) {
-            _deviceIp.value = getDeviceIpAddress()
+            _deviceIp.value = getDeviceIpAddress(applicationContext)
+            _availableNetworks.value = getAvailableIpAddresses()
+        }
+    }
+
+    fun setSelectedIp(context: Context, ip: String?) {
+        viewModelScope.launch {
+            try {
+                val connectedDeviceIds = devices.value
+                    .filter { it.connectionState == ConnectionState.CONNECTED }
+                    .map { it.deviceId }
+
+                if (connectedDeviceIds.isNotEmpty()) {
+                    val service = _usbService.filterNotNull().first()
+                    for (id in connectedDeviceIds) {
+                        service.disconnectDeviceManually(id)
+                    }
+                    delay(500)
+                }
+
+                NetworkPreferences.setSelectedIp(context, ip)
+                _deviceIp.value = getDeviceIpAddress(context)
+                _availableNetworks.value = getAvailableIpAddresses()
+
+                try {
+                    _usbService.filterNotNull().first().restartServerAndNsd()
+                } catch (_: Exception) {}
+
+                if (connectedDeviceIds.isNotEmpty()) {
+                    delay(500)
+                    for (id in connectedDeviceIds) {
+                        connectDevice(id)
+                    }
+                } else {
+                    refreshDevices()
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("UsbDeviceViewModel", "Failed to change IP and reconnect: ${e.message}")
+                NetworkPreferences.setSelectedIp(context, ip)
+                _deviceIp.value = getDeviceIpAddress(context)
+                _availableNetworks.value = getAvailableIpAddresses()
+                refreshDevices()
+            }
         }
     }
 

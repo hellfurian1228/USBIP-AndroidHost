@@ -749,7 +749,8 @@ class UsbServerService : Service() {
             nativeServerMutex.withLock {
                 if (!isNativeServerStarted) {
                     Log.i("UsbServerService", "Starting persistent native server daemon")
-                    startNativeServer(-1) // Start as daemon without initial device
+                    val currentIp = getDeviceIpAddress(applicationContext)
+                    startNativeServer(-1, currentIp)
                     isNativeServerStarted = true
                     usbipNsdManager.registerService(3240)
                 }
@@ -773,6 +774,20 @@ class UsbServerService : Service() {
         }
 
         return START_STICKY // Stay running
+    }
+
+    fun restartServerAndNsd() {
+        try {
+            val currentIp = getDeviceIpAddress(applicationContext)
+            Log.i("UsbServerService", "Restarting server and NSD with strict IP: $currentIp")
+            usbipNsdManager.unregisterService()
+            stopNativeServer()
+            startNativeServer(-1, currentIp)
+            isNativeServerStarted = true
+            usbipNsdManager.registerService(3240)
+        } catch (e: Exception) {
+            Log.e("UsbServerService", "Failed to restart server and NSD: ${e.message}")
+        }
     }
 
     override fun onDestroy() {
@@ -815,7 +830,7 @@ class UsbServerService : Service() {
     /**
      * A native method that is implemented by the 'usbip_server' native library.
      */
-    private external fun startNativeServer(deviceFd: Int)
+    private external fun startNativeServer(deviceFd: Int, serverIp: String)
     private external fun stopNativeServer()
     private external fun updateDeviceFd(busId: String, newFd: Int)
     private external fun invalidateDeviceFd(busId: String)
