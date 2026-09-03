@@ -1,10 +1,20 @@
 # USBIP-AndroidHost
+<img width="256" height="256" alt="usbip" src="https://github.com/user-attachments/assets/4954a663-82e8-498c-a0f6-79545346c4ea" />
 
 [![Status](https://img.shields.io/badge/Status-Beta-orange.svg?style=flat-square)](https://github.com/hellfurian1228/USBIP-AndroidHost)
 [![Platform](https://img.shields.io/badge/Platform-Android-3DDC84.svg?style=flat-square&logo=android)](https://developer.android.com/about/dashboards)
 [![Donate](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=flat-square&logo=paypal)](https://www.paypal.com/donate/?hosted_button_id=P3P43EXYJWRLC)
 
-A streamlined Android implementation of the **USB/IP** protocol. This app transforms your Android device into a network-attached USB hub, allowing you to "tunnel" physical hardware—like racing wheels, pedals, and game controllers—directly to a remote Windows or Linux machine.
+## ☕ Support the Project
+If you find this tool useful and want to support continued development, I utilize subscription based software for code. Donations will go towards this. Thanks!
+
+[**Donate via PayPal**](https://www.paypal.com/donate/?hosted_button_id=P3P43EXYJWRLC)
+
+## Discord https://discord.gg/R2nfbS4K2
+
+## USBIP-AndroidHost
+
+A streamlined Android implementation of the **USB/IP** protocol. This app transforms your Android device into a network-attached USB hub, allowing you to "tunnel" physical hardware—like sim equipment, game controllers, 3D printers/scanners, and storage devices—directly to a remote Windows or Linux machine.
 
 ## 🕹️ Why this exists
 Most USB/IP solutions require complex Linux setups or rooted devices. This project aims to make the process accessible through a standard Android app, specifically tuned for low-latency peripherals like sim-racing gear.
@@ -29,11 +39,6 @@ Most USB/IP solutions require complex Linux setups or rooted devices. This proje
 *   On your PC, launch your USB/IP client.
 *   Input the Android device's IP and scan/attach the remote device.
 *   The peripheral will now behave as if it were plugged directly into your PC.
-
-## ☕ Support the Project
-If you find this tool useful and want to support continued development (especially for testing new hardware), feel free to buy me a coffee!
-
-[**Donate via PayPal**](https://www.paypal.com/donate/?hosted_button_id=P3P43EXYJWRLC)
 
 ## 🛠️ Tech Stack
 *   **Kotlin:** Modern, lifecycle-aware UI and service management.
