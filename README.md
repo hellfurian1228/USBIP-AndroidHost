@@ -40,6 +40,8 @@ If you find this tool useful and want to support continued development, I utiliz
 
 [**Donate via PayPal**](https://www.paypal.com/donate/?hosted_button_id=P3P43EXYJWRLC)
 
+[**Donate via Ko-Fi**](https://ko-fi.com/mizukos)
+
 ## Discord https://discord.gg/R2nfbS4K2
 
 ## 📦 Installation & Usage
@@ -73,16 +75,5 @@ If you find this tool useful and want to support continued development, I utiliz
 *   Google Pixel 10 Fold Pro
 *   Essential PH-1
 *   Samsung Tab A8
-
----
-
-## 📜 Credits & Acknowledgements
-
-This project is built upon the foundational work of the global open-source community:
-
-*   **Takahiro Hirofuchi & the NAIST Research Team:** The original architects of the USB/IP protocol and researchers at the Nara Institute of Science and Technology.
-*   **The Linux Kernel Community:** For maintaining and improving the core USB/IP drivers within the mainline kernel.
-*   **cezanne (GitHub):** The creator of the `usbip-win` project, which successfully ported the Virtual Host Controller Interface (VHCI) to Windows.
-*   **USBIP-Win2 Community:** For the ongoing development of modern Windows drivers and clients that this host is designed to communicate with.
 
 *Note: This is an early beta. Use it, break it, and report issues to help improve stability.*
