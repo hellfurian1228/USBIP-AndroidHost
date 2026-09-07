@@ -8,5 +8,6 @@ data class UsbDeviceInfo(
     val deviceName: String,
     val deviceId: Int,
     val devicePath: String,
-    val connectionState: ConnectionState = ConnectionState.DISCONNECTED
+    val connectionState: ConnectionState = ConnectionState.DISCONNECTED,
+    val transferSpeedMbps: Int = 0
 )

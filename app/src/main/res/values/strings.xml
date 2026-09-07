@@ -12,6 +12,7 @@
     <string name="status_running">Persistent Daemon Running</string>
     <string name="device_details_format">ID: %1$d | Path: %2$s</string>
     <string name="connected_active">CONNECTED ACTIVE</string>
+    <string name="connected_active_speed">CONNECTED ACTIVE | %1$d Mb/s</string>
     <string name="refresh">Refresh</string>
     <string name="default_ip">Server IP: 127.0.0.1</string>
     <string name="default_device_name">USB Device Name</string>

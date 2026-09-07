@@ -11,10 +11,10 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
-sealed class UsbUiState {
-    object Idle : UsbUiState()
-    object Loading : UsbUiState()
-    data class Success(val devices: List<UsbDeviceInfo>) : UsbUiState()
+sealed interface UsbUiState {
+    data object Idle : UsbUiState
+    data object Loading : UsbUiState
+    data class Success(val devices: List<UsbDeviceInfo>) : UsbUiState
 }
 
 class UsbDeviceViewModel(private val usbManager: UsbManager) : ViewModel() {
@@ -38,9 +38,12 @@ class UsbDeviceViewModel(private val usbManager: UsbManager) : ViewModel() {
         available.map { device ->
             val exportedInfo = exported.values.find { it.deviceId == device.deviceId }
             when {
-                exportedInfo == null -> device.copy(connectionState = ConnectionState.DISCONNECTED)
-                exportedInfo.isConnected -> device.copy(connectionState = ConnectionState.CONNECTED)
-                else -> device.copy(connectionState = ConnectionState.CONNECTING)
+                exportedInfo == null -> device.copy(connectionState = ConnectionState.DISCONNECTED, transferSpeedMbps = 0)
+                exportedInfo.isConnected -> device.copy(
+                    connectionState = ConnectionState.CONNECTED,
+                    transferSpeedMbps = exportedInfo.transferSpeedMbps
+                )
+                else -> device.copy(connectionState = ConnectionState.CONNECTING, transferSpeedMbps = 0)
             }
         }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())

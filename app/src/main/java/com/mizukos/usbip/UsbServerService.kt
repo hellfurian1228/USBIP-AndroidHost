@@ -54,6 +54,7 @@ class UsbServerService : Service() {
     private lateinit var usbManager: UsbManager
     private var isNativeServerStarted = false
     private lateinit var usbipNsdManager: UsbipNsdManager
+    private lateinit var telemetryServer: TelemetryServer
 
     data class DeviceHandle(
         val device: UsbDevice,
@@ -65,7 +66,8 @@ class UsbServerService : Service() {
     enum class SpecialDeviceProfile {
         LOGITECH_G29,
         ETHERNET,
-        STEAM_CONTROLLER, // Add this profile
+        STEAM_CONTROLLER,
+        MASS_STORAGE,
         GENERIC
     }
 
@@ -75,7 +77,8 @@ class UsbServerService : Service() {
         val productName: String,
         val vendorId: Int,
         val productId: Int,
-        val isConnected: Boolean
+        val isConnected: Boolean,
+        val transferSpeedMbps: Int = 0
     )
 
     private val openedDevices = ConcurrentHashMap<String, DeviceHandle>()
@@ -87,15 +90,22 @@ class UsbServerService : Service() {
     private val deviceNameToBusId = ConcurrentHashMap<String, String>() // deviceName to busId
     
     // Tracks devices user explicitly wanted to export (survives G29 mode switch resets)
-    private val authorizedBusIds = mutableSetOf<String>()
+    private val authorizedBusIds = java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     
     // UI Synchronization
     private val _deviceList = MutableStateFlow<Map<String, DeviceInfo>>(emptyMap())
     val deviceList: StateFlow<Map<String, DeviceInfo>> = _deviceList.asStateFlow()
 
     // Permission Queuing
-    private val permissionQueue: Queue<UsbDevice> = LinkedList()
-    private var isRequestingPermission = false
+    private val permissionQueue = java.util.concurrent.ConcurrentLinkedQueue<UsbDevice>()
+    private val isRequestingPermission = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    // Cached reflection Method for UsbDevice.getSpeed() (API 31+)
+    private val getSpeedMethod = try {
+        UsbDevice::class.java.getMethod("getSpeed")
+    } catch (_: Exception) {
+        null
+    }
 
     // JNI accessors (Now querying the map)
     @Suppress("unused")
@@ -111,9 +121,9 @@ class UsbServerService : Service() {
     @Suppress("unused")
     fun getSpeedForBusId(busId: String): Int {
         val device = openedDevices[busId]?.device ?: return 3
-        if (Build.VERSION.SDK_INT >= 31) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try {
-                val s = device.javaClass.getMethod("getSpeed").invoke(device) as Int
+                val s = getSpeedMethod?.invoke(device) as? Int
                 return when (s) {
                     1 -> 1 // LOW
                     2 -> 2 // FULL
@@ -176,34 +186,33 @@ class UsbServerService : Service() {
     }
 
     /**
-     * Build a raw USB/IP OP_REP_DEVLIST body (number of devices + devices + interfaces)
-     * Queries UsbManager directly to ensure no ghost entries or stale metadata.
+     * Build a raw USB/IP OP_REP_DEVLIST body directly into a Direct ByteBuffer for Zero-Copy JNI access.
      */
     @Suppress("unused")
-    fun getExportedDevicesPayload(): ByteArray {
+    fun getExportedDevicesPayloadDirect(): ByteBuffer {
         val currentHardware = usbManager.deviceList.values
-        // Real-time synchronization: filter hardware by active/authorized handles
         val exported = currentHardware.filter { dev ->
             openedDevices.values.any { it.device.deviceName == dev.deviceName }
         }
 
         if (exported.isEmpty()) {
-            return ByteBuffer.allocate(4).apply { putInt(0) }.array()
+            val emptyBuffer = ByteBuffer.allocateDirect(4).order(ByteOrder.BIG_ENDIAN)
+            emptyBuffer.putInt(0)
+            emptyBuffer.flip()
+            return emptyBuffer
         }
 
-        // Calculate dynamic buffer size: 4 (number of devices) + sum(312 + supported_interface_count * 4)
         val totalSize = 4 + exported.sumOf { dev ->
             val supportedCount = (0 until dev.interfaceCount)
                 .map { dev.getInterface(it) }
                 .count { isInterfaceSupported(it) }
             312 + (minOf(supportedCount, 32) * 4)
         }
-        val buffer = ByteBuffer.allocate(totalSize).order(ByteOrder.BIG_ENDIAN)
+        val buffer = ByteBuffer.allocateDirect(totalSize).order(ByteOrder.BIG_ENDIAN)
 
         buffer.putInt(exported.size)
 
         for (device in exported) {
-            // Match the specific handle to retrieve our assigned Bus ID
             val handle = openedDevices.values.find { it.device.deviceName == device.deviceName }
             val busId = handle?.busId ?: "1-0"
 
@@ -222,13 +231,28 @@ class UsbServerService : Service() {
 
             buffer.putInt(1) // bus number
             buffer.putInt(device.deviceId) // device number (transient ID)
-            
-            // Speed reporting (USBIP values: 1=Low, 2=Full, 3=High, 5=Super)
-            // Use reflection for getSpeed() to support API 31+ while compiling against older SDKs if needed
+
+            var bcdDeviceVal = 0x0111
+            var bcdUsbVal = 0x0200
+            var devClass = device.deviceClass
+            var devSubClass = device.deviceSubclass
+            var devProtocol = device.deviceProtocol
+            var numConfig = 1
+
+            val rawDesc = handle?.connection?.rawDescriptors
+            if (rawDesc != null && rawDesc.size >= 18 && (rawDesc[0].toInt() and 0xFF) >= 18 && (rawDesc[1].toInt() and 0xFF) == 1) {
+                bcdUsbVal = ((rawDesc[3].toInt() and 0xFF) shl 8) or (rawDesc[2].toInt() and 0xFF)
+                devClass = rawDesc[4].toInt() and 0xFF
+                devSubClass = rawDesc[5].toInt() and 0xFF
+                devProtocol = rawDesc[6].toInt() and 0xFF
+                bcdDeviceVal = ((rawDesc[13].toInt() and 0xFF) shl 8) or (rawDesc[12].toInt() and 0xFF)
+                numConfig = rawDesc[17].toInt() and 0xFF
+            }
+
             var speedValue = 3
             if (Build.VERSION.SDK_INT >= 31) {
                 try {
-                    val s = device.javaClass.getMethod("getSpeed").invoke(device) as Int
+                    val s = getSpeedMethod?.invoke(device) as? Int
                     speedValue = when (s) {
                         1 -> 1 // LOW
                         2 -> 2 // FULL
@@ -239,28 +263,28 @@ class UsbServerService : Service() {
                     }
                 } catch (_: Exception) { }
             }
+            if (bcdUsbVal >= 0x0300 && speedValue < 5) {
+                speedValue = 5 // USB 3.0 SuperSpeed
+            }
             buffer.putInt(speedValue)
 
-            // Dynamic Hardware Attributes
             buffer.putShort((device.vendorId and 0xFFFF).toShort())
             buffer.putShort((device.productId and 0xFFFF).toShort())
-            buffer.putShort(0x0111.toShort()) // bcdDevice (G29 compliant)
+            buffer.putShort((bcdDeviceVal and 0xFFFF).toShort())
 
-            buffer.put(device.deviceClass.toByte())
-            buffer.put(device.deviceSubclass.toByte())
-            buffer.put(device.deviceProtocol.toByte())
+            buffer.put(devClass.toByte())
+            buffer.put(devSubClass.toByte())
+            buffer.put(devProtocol.toByte())
             buffer.put(1.toByte()) // bConfigurationValue
-            buffer.put(1.toByte()) // bNumConfigurations
-            
-            // Strictly validate supported interface count
+            buffer.put(maxOf(numConfig, 1).toByte()) // bNumConfigurations
+
             val supportedInterfaces = (0 until device.interfaceCount)
                 .map { device.getInterface(it) }
                 .filter { isInterfaceSupported(it) }
-            
+
             val intfCount = minOf(supportedInterfaces.size, 32)
             buffer.put(intfCount.toByte())
 
-            // Interface Descriptors (4 bytes each)
             for (i in 0 until intfCount) {
                 val interfaceDescriptor = supportedInterfaces[i]
                 buffer.put(interfaceDescriptor.interfaceClass.toByte())
@@ -270,8 +294,21 @@ class UsbServerService : Service() {
             }
         }
 
-        Log.i("UsbServerService", "Generated dynamic Device List payload for ${exported.size} device(s)")
-        return buffer.array()
+        buffer.flip()
+        Log.i("UsbServerService", "Generated dynamic direct Device List payload (${buffer.remaining()} bytes) for ${exported.size} device(s)")
+        return buffer
+    }
+
+    /**
+     * Build a raw USB/IP OP_REP_DEVLIST body (number of devices + devices + interfaces)
+     * Queries UsbManager directly to ensure no ghost entries or stale metadata.
+     */
+    @Suppress("unused")
+    fun getExportedDevicesPayload(): ByteArray {
+        val directBuffer = getExportedDevicesPayloadDirect()
+        val bytes = ByteArray(directBuffer.remaining())
+        directBuffer.get(bytes)
+        return bytes
     }
 
     private val usbReceiver = object : android.content.BroadcastReceiver() {
@@ -299,7 +336,7 @@ class UsbServerService : Service() {
                 }
                 ACTION_USB_PERMISSION_SERVICE -> {
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                    isRequestingPermission = false
+                    isRequestingPermission.set(false) // <--- ATOMIC RESET HERE
                     
                     // Retrieve the device from the intent
                     val targetDevice: UsbDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -345,12 +382,26 @@ class UsbServerService : Service() {
             return SpecialDeviceProfile.LOGITECH_G29
         }
 
-        // Ethernet / CDC Network - Class 0x02 (Communications) or 0xFF (Vendor Specific)
-        if (device.deviceClass == 0x02 || device.deviceClass == 0xFF) {
-            for (i in 0 until device.interfaceCount) {
-                val intf = device.getInterface(i)
-                if (intf.interfaceClass == 0x02 || intf.interfaceClass == 0x0A) return SpecialDeviceProfile.ETHERNET
+        // Mass Storage (0x08)
+        for (i in 0 until device.interfaceCount) {
+            val intf = device.getInterface(i)
+            if (intf.interfaceClass == UsbConstants.USB_CLASS_MASS_STORAGE) {
+                return SpecialDeviceProfile.MASS_STORAGE
             }
+        }
+        if (device.deviceClass == UsbConstants.USB_CLASS_MASS_STORAGE) {
+            return SpecialDeviceProfile.MASS_STORAGE
+        }
+
+        // Ethernet / CDC Network - Communications (0x02), CDC Data (0x0A), or Vendor Specific (0xFF)
+        for (i in 0 until device.interfaceCount) {
+            val intf = device.getInterface(i)
+            val cls = intf.interfaceClass
+            if (cls == 0x02 || cls == 0x0A) return SpecialDeviceProfile.ETHERNET
+        }
+
+        if (device.deviceClass == 0x02 || device.deviceClass == 0xFF) {
+            return SpecialDeviceProfile.ETHERNET
         }
 
         return SpecialDeviceProfile.GENERIC
@@ -394,7 +445,7 @@ class UsbServerService : Service() {
         var speedStr = "UNKNOWN / PRE-API 31"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try {
-                val speedInt = device.javaClass.getMethod("getSpeed").invoke(device) as Int
+                val speedInt = getSpeedMethod?.invoke(device) as? Int ?: 0
                 speedStr = when (speedInt) {
                     0 -> "UNKNOWN (0)"
                     1 -> "LOW_SPEED (1) - 1.5 Mbps"
@@ -479,28 +530,34 @@ class UsbServerService : Service() {
     }
 
     private fun processNextPermissionRequest() {
-        if (isRequestingPermission || permissionQueue.isEmpty()) return
+        if (permissionQueue.isEmpty()) return
         
-        val device = permissionQueue.poll() ?: return
-        isRequestingPermission = true
-        
-        // UI Sync: Show connecting state now that we are actually triggering the prompt
-        val busId = getBusId(device)
-        pendingConnections[busId] = device.deviceId
-        updateUiState()
-        
-        requestPermissionForDevice(device)
-        
-        // Safety timeout for permission dialog
-        serviceScope.launch {
-            delay(30.seconds)
-            if (isRequestingPermission) {
-                isRequestingPermission = false
-                Log.w("UsbServerService", "Permission request timed out for ${device.deviceName}")
-                val currentBusId = activeDeviceIdTracker[device.deviceId] ?: getBusId(device)
-                pendingConnections.remove(currentBusId)
-                updateUiState()
-                processNextPermissionRequest()
+        // Atomically check if false, and if so, set to true. Prevents multi-thread overlap.
+        if (isRequestingPermission.compareAndSet(false, true)) {
+            val device = permissionQueue.poll()
+            if (device == null) {
+                isRequestingPermission.set(false)
+                return
+            }
+            
+            // UI Sync: Show connecting state now that we are actually triggering the prompt
+            val busId = getBusId(device)
+            pendingConnections[busId] = device.deviceId
+            updateUiState()
+            
+            requestPermissionForDevice(device)
+            
+            // Safety timeout for permission dialog
+            serviceScope.launch {
+                delay(30.seconds)
+                // If it's still true after 30 seconds, the user ignored the prompt
+                if (isRequestingPermission.compareAndSet(true, false)) {
+                    Log.w("UsbServerService", "Permission request timed out for ${device.deviceName}")
+                    val currentBusId = activeDeviceIdTracker[device.deviceId] ?: getBusId(device)
+                    pendingConnections.remove(currentBusId)
+                    updateUiState()
+                    processNextPermissionRequest()
+                }
             }
         }
     }
@@ -600,29 +657,36 @@ class UsbServerService : Service() {
         
         // 1. Add currently opened/exported devices
         openedDevices.forEach { (busId, handle) ->
+            val speed = getTransferSpeedForBusId(busId)
             uiMap[busId] = DeviceInfo(
                 deviceId = handle.device.deviceId,
                 busId = busId,
                 productName = handle.device.productName ?: "Unknown Device",
                 vendorId = handle.device.vendorId,
                 productId = handle.device.productId,
-                isConnected = true
+                isConnected = true,
+                transferSpeedMbps = speed
             )
         }
         
         // 2. Add devices currently in the process of connecting
-        pendingConnections.forEach { (busId, deviceId) ->
-            if (!uiMap.containsKey(busId)) {
-                val device = usbManager.deviceList.values.find { it.deviceId == deviceId }
-                if (device != null) {
-                    uiMap[busId] = DeviceInfo(
-                        deviceId = deviceId,
-                        busId = busId,
-                        productName = device.productName ?: "Connecting...",
-                        vendorId = device.vendorId,
-                        productId = device.productId,
-                        isConnected = false
-                    )
+        if (pendingConnections.isNotEmpty()) {
+            // Fetch IPC device list ONCE outside the loop
+            val currentSystemDevices = usbManager.deviceList.values 
+            
+            pendingConnections.forEach { (busId, deviceId) ->
+                if (!uiMap.containsKey(busId)) {
+                    val device = currentSystemDevices.find { it.deviceId == deviceId }
+                    if (device != null) {
+                        uiMap[busId] = DeviceInfo(
+                            deviceId = deviceId,
+                            busId = busId,
+                            productName = device.productName ?: "Connecting...",
+                            vendorId = device.vendorId,
+                            productId = device.productId,
+                            isConnected = false
+                        )
+                    }
                 }
             }
         }
@@ -691,8 +755,11 @@ class UsbServerService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.i("UsbServerService", "Service onCreate")
+        ErrorLogger.init(this)
         usbManager = getSystemService(USB_SERVICE) as UsbManager
         usbipNsdManager = UsbipNsdManager(this)
+        telemetryServer = TelemetryServer(port = 3241) { getTelemetryJson() }
+        telemetryServer.start(serviceScope)
         
         // Initialize locks but do not acquire them yet
         val powerManager = getSystemService(POWER_SERVICE) as PowerManager
@@ -750,9 +817,16 @@ class UsbServerService : Service() {
                 if (!isNativeServerStarted) {
                     Log.i("UsbServerService", "Starting persistent native server daemon")
                     val currentIp = getDeviceIpAddress(applicationContext)
-                    startNativeServer(-1, currentIp)
-                    isNativeServerStarted = true
-                    usbipNsdManager.registerService(3240)
+                    val started = startNativeServer(-1, currentIp)
+                    if (started) {
+                        isNativeServerStarted = true
+                        usbipNsdManager.registerService(3240)
+                    } else {
+                        // Do not advertise via NSD if the socket never actually
+                        // bound/listened - otherwise clients discover a host
+                        // that refuses every connection (WSAECONNREFUSED/10061).
+                        Log.e("UsbServerService", "Native USB/IP server failed to start; not advertising via NSD")
+                    }
                 }
             }
 
@@ -782,11 +856,18 @@ class UsbServerService : Service() {
             Log.i("UsbServerService", "Restarting server and NSD with strict IP: $currentIp")
             usbipNsdManager.unregisterService()
             stopNativeServer()
-            startNativeServer(-1, currentIp)
-            isNativeServerStarted = true
-            usbipNsdManager.registerService(3240)
+            val started = startNativeServer(-1, currentIp)
+            isNativeServerStarted = started
+            if (started) {
+                usbipNsdManager.registerService(3240)
+            } else {
+                // Mirrors the guard in onStartCommand: never advertise a port
+                // that isn't actually listening, or clients will see 10061.
+                Log.e("UsbServerService", "Native USB/IP server failed to restart; not advertising via NSD")
+            }
         } catch (e: Exception) {
             Log.e("UsbServerService", "Failed to restart server and NSD: ${e.message}")
+            isNativeServerStarted = false
         }
     }
 
@@ -800,6 +881,7 @@ class UsbServerService : Service() {
 
         stopNativeServer()
         usbipNsdManager.unregisterService()
+        telemetryServer.stop()
         openedDevices.values.forEach { it.connection.close() }
         openedDevices.clear()
         _deviceList.value = emptyMap()
@@ -830,10 +912,14 @@ class UsbServerService : Service() {
     /**
      * A native method that is implemented by the 'usbip_server' native library.
      */
-    private external fun startNativeServer(deviceFd: Int, serverIp: String)
+    private external fun startNativeServer(deviceFd: Int, serverIp: String): Boolean
     private external fun stopNativeServer()
     private external fun updateDeviceFd(busId: String, newFd: Int)
     private external fun invalidateDeviceFd(busId: String)
+    @Suppress("unused")
+    private external fun getTransferSpeedForBusId(busId: String): Int
+    @Suppress("unused")
+    external fun getTelemetryJson(): String
 
     companion object {
         private const val CHANNEL_ID = "UsbServerChannel"

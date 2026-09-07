@@ -24,6 +24,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.card.MaterialCardView
 import kotlinx.coroutines.Dispatchers
@@ -75,6 +76,9 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         
         setContentView(R.layout.activity_main)
+
+        // Initialize persistent log writer and crash handler
+        ErrorLogger.init(this)
 
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main_root)) { v, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
@@ -138,11 +142,14 @@ class MainActivity : ComponentActivity() {
         val message = if (logs.isEmpty()) "No debug logs captured yet." else logs
         
         androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle("Debug Logs")
+            .setTitle("Debug Logs & Diagnostics")
             .setMessage(message)
             .setPositiveButton("Close", null)
-            .setNeutralButton("Copy") { _, _ ->
+            .setNeutralButton("Copy Report") { _, _ ->
                 ErrorLogger.copyLogsToClipboard(this)
+            }
+            .setNegativeButton("Share Zip") { _, _ ->
+                ErrorLogger.shareLogArchive(this)
             }
             .show()
     }
@@ -347,23 +354,7 @@ class MainActivity : ComponentActivity() {
     inner class DeviceAdapter(
         private val onConnect: (UsbDeviceInfo) -> Unit,
         private val onDisconnect: (UsbDeviceInfo) -> Unit
-    ) : RecyclerView.Adapter<DeviceViewHolder>() {
-
-        private var devices: List<UsbDeviceInfo> = emptyList()
-
-        fun submitList(newList: List<UsbDeviceInfo>) {
-            val diffCallback = object : DiffUtil.Callback() {
-                override fun getOldListSize(): Int = devices.size
-                override fun getNewListSize(): Int = newList.size
-                override fun areItemsTheSame(oldPos: Int, newPos: Int): Boolean =
-                    devices[oldPos].deviceId == newList[newPos].deviceId
-                override fun areContentsTheSame(oldPos: Int, newPos: Int): Boolean =
-                    devices[oldPos] == newList[newPos]
-            }
-            val diffResult = DiffUtil.calculateDiff(diffCallback)
-            devices = newList
-            diffResult.dispatchUpdatesTo(this)
-        }
+    ) : ListAdapter<UsbDeviceInfo, DeviceViewHolder>(DeviceDiffCallback()) {
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): DeviceViewHolder {
             val view = LayoutInflater.from(parent.context).inflate(R.layout.item_device, parent, false)
@@ -371,11 +362,15 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onBindViewHolder(holder: DeviceViewHolder, position: Int) {
-            val device = devices[position]
-            holder.bind(device, onConnect, onDisconnect)
+            holder.bind(getItem(position), onConnect, onDisconnect)
         }
+    }
 
-        override fun getItemCount(): Int = devices.size
+    class DeviceDiffCallback : DiffUtil.ItemCallback<UsbDeviceInfo>() {
+        override fun areItemsTheSame(oldItem: UsbDeviceInfo, newItem: UsbDeviceInfo) =
+            oldItem.deviceId == newItem.deviceId
+        override fun areContentsTheSame(oldItem: UsbDeviceInfo, newItem: UsbDeviceInfo) =
+            oldItem == newItem
     }
 
     inner class DeviceViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
@@ -399,6 +394,11 @@ class MainActivity : ComponentActivity() {
 
             if (isExported) {
                 card.setCardBackgroundColor(getColor(R.color.green))
+                tvStatus.text = if (device.transferSpeedMbps > 0) {
+                    getString(R.string.connected_active_speed, device.transferSpeedMbps)
+                } else {
+                    getString(R.string.connected_active)
+                }
                 btnAction.text = getString(R.string.disconnect)
                 btnAction.setOnClickListener { onDisconnect(device) }
             } else {

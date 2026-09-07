@@ -67,8 +67,8 @@ fun getAvailableIpAddresses(): List<NetworkIp> {
  * 3. Fallback to first available non-loopback IPv4 or "127.0.0.1".
  */
 fun getDeviceIpAddress(context: Context? = null): String {
-    if (context != (null as Context?)) {
-        val selected = NetworkPreferences.getSelectedIp(context!!)
+    if (context != null) {
+        val selected = NetworkPreferences.getSelectedIp(context)
         if (!selected.isNullOrEmpty()) {
             val available = getAvailableIpAddresses()
             if (available.any { it.address == selected }) {

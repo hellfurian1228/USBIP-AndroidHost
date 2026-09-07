@@ -3,6 +3,7 @@ package com.mizukos.usbip
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Build
 import android.util.Log
 import java.net.InetAddress
 
@@ -34,9 +35,13 @@ class UsbipNsdManager(private val context: Context) {
             serviceName = SERVICE_NAME
             serviceType = SERVICE_TYPE
             setPort(port)
+            setAttribute("telemetry", "1")
+            setAttribute("t_port", "3241")
+            setAttribute("t_path", "/telemetry")
+            setAttribute("t_schema", "1")
             try {
                 val address = InetAddress.getByName(getDeviceIpAddress(context))
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     setHostAddresses(listOf(address))
                 } else {
                     @Suppress("DEPRECATION")
