@@ -5,6 +5,8 @@
 [![Platform](https://img.shields.io/badge/Platform-Android-3DDC84.svg?style=flat-square&logo=android)](https://developer.android.com/about/dashboards)
 [![Donate](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=flat-square&logo=paypal)](https://www.paypal.com/donate/?hosted_button_id=P3P43EXYJWRLC)
 
+https://mizukos.itch.io/usbip
+
 ## USBIP-AndroidHost
 A streamlined Android implementation of the **USB/IP** protocol. This app transforms your Android device into a network-attached USB hub, allowing you to "tunnel" physical hardware—like sim equipment, game controllers, 3D printers/scanners, and storage devices—directly to a remote Windows or Linux machine.
 
