@@ -189,6 +189,10 @@ class UsbDeviceViewModel(private val usbManager: UsbManager) : ViewModel() {
         _availableDevices.value = infoList
     }
 
+    fun enableSyntheticDevice(enable: Boolean) {
+        _usbService.value?.enableSyntheticDevice(enable)
+    }
+
     fun updateStatus(message: String?) {
         _statusMessage.value = message
     }

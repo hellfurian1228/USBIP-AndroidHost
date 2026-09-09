@@ -112,7 +112,7 @@ class TelemetryServer(
         val writer = PrintWriter(socket.getOutputStream(), true)
         writer.print("HTTP/1.1 $statusCode ${getStatusText(statusCode)}\r\n")
         writer.print("Content-Type: text/plain; charset=UTF-8\r\n")
-        writer.print("Content-Length: ${message.length}\r\n")
+        writer.print("Content-Length: ${message.toByteArray(Charsets.UTF_8).size}\r\n")
         writer.print("Connection: close\r\n")
         writer.print("\r\n")
         writer.print(message)

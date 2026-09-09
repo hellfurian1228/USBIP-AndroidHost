@@ -137,6 +137,12 @@ class UsbServerService : Service() {
         return 3
     }
 
+    fun enableSyntheticDevice(enable: Boolean) {
+        isSyntheticInputActive = enable
+        Log.i("UsbServerService", "Synthetic device toggle updated: isSyntheticInputActive = $enable")
+        updateUiState()
+    }
+
     fun connectDeviceManually(device: UsbDevice) {
         val busId = getBusId(device)
         // Manual override: clear any stuck pending state to allow a fresh connection attempt
@@ -181,7 +187,7 @@ class UsbServerService : Service() {
         // 3. Purge session trackers
         activeDeviceIdTracker.remove(deviceId)
         
-        // 5. Reactive UI Sync
+        // 4. Reactive UI Sync
         updateUiState()
     }
 
@@ -195,42 +201,46 @@ class UsbServerService : Service() {
             openedDevices.values.any { it.device.deviceName == dev.deviceName }
         }
 
-        if (exported.isEmpty()) {
+        // If no physical devices AND no synthetic device, return 0
+        if (exported.isEmpty() && !isSyntheticInputActive) {
             val emptyBuffer = ByteBuffer.allocateDirect(4).order(ByteOrder.BIG_ENDIAN)
             emptyBuffer.putInt(0)
             emptyBuffer.flip()
             return emptyBuffer
         }
 
-        val totalSize = 4 + exported.sumOf { dev ->
+        val physicalSize = exported.sumOf { dev ->
             val supportedCount = (0 until dev.interfaceCount)
                 .map { dev.getInterface(it) }
                 .count { isInterfaceSupported(it) }
             312 + (minOf(supportedCount, 32) * 4)
         }
+        
+        // 316 bytes = 312 device metadata + 4 bytes for 1 interface (HID)
+        val syntheticSize = if (isSyntheticInputActive) 316 else 0
+        val totalSize = 4 + physicalSize + syntheticSize
+        
         val buffer = ByteBuffer.allocateDirect(totalSize).order(ByteOrder.BIG_ENDIAN)
 
-        buffer.putInt(exported.size)
+        // Write total device count (Physical + 1 Virtual)
+        buffer.putInt(exported.size + (if (isSyntheticInputActive) 1 else 0))
 
+        // --- 1. WRITE PHYSICAL DEVICES ---
         for (device in exported) {
             val handle = openedDevices.values.find { it.device.deviceName == device.deviceName }
             val busId = handle?.busId ?: "1-0"
-
             val startPos = buffer.position()
 
-            // path (256 bytes) - Padded
-            val pathStr = "/sys/devices/virtual/usbip/$busId"
-            val pathBytes = pathStr.toByteArray()
+            val pathBytes = "/sys/devices/virtual/usbip/$busId".toByteArray()
             buffer.put(pathBytes, 0, minOf(pathBytes.size, 256))
             buffer.position(startPos + 256)
 
-            // busId (32 bytes) - Padded
             val bIdBytes = busId.toByteArray()
             buffer.put(bIdBytes, 0, minOf(bIdBytes.size, 32))
             buffer.position(startPos + 256 + 32)
 
-            buffer.putInt(1) // bus number
-            buffer.putInt(device.deviceId) // device number (transient ID)
+            buffer.putInt(1) 
+            buffer.putInt(device.deviceId) 
 
             var bcdDeviceVal = 0x0111
             var bcdUsbVal = 0x0200
@@ -254,29 +264,22 @@ class UsbServerService : Service() {
                 try {
                     val s = getSpeedMethod?.invoke(device) as? Int
                     speedValue = when (s) {
-                        1 -> 1 // LOW
-                        2 -> 2 // FULL
-                        3 -> 3 // HIGH
-                        4 -> 5 // SUPER
-                        5 -> 5 // SUPER_PLUS
+                        1 -> 1; 2 -> 2; 3 -> 3; 4 -> 5; 5 -> 5
                         else -> 3
                     }
                 } catch (_: Exception) { }
             }
-            if (bcdUsbVal >= 0x0300 && speedValue < 5) {
-                speedValue = 5 // USB 3.0 SuperSpeed
-            }
+            if (bcdUsbVal >= 0x0300 && speedValue < 5) speedValue = 5
+            
             buffer.putInt(speedValue)
-
             buffer.putShort((device.vendorId and 0xFFFF).toShort())
             buffer.putShort((device.productId and 0xFFFF).toShort())
             buffer.putShort((bcdDeviceVal and 0xFFFF).toShort())
-
             buffer.put(devClass.toByte())
             buffer.put(devSubClass.toByte())
             buffer.put(devProtocol.toByte())
-            buffer.put(1.toByte()) // bConfigurationValue
-            buffer.put(maxOf(numConfig, 1).toByte()) // bNumConfigurations
+            buffer.put(1.toByte())
+            buffer.put(maxOf(numConfig, 1).toByte())
 
             val supportedInterfaces = (0 until device.interfaceCount)
                 .map { device.getInterface(it) }
@@ -286,16 +289,51 @@ class UsbServerService : Service() {
             buffer.put(intfCount.toByte())
 
             for (i in 0 until intfCount) {
-                val interfaceDescriptor = supportedInterfaces[i]
-                buffer.put(interfaceDescriptor.interfaceClass.toByte())
-                buffer.put(interfaceDescriptor.interfaceSubclass.toByte())
-                buffer.put(interfaceDescriptor.interfaceProtocol.toByte())
-                buffer.put(0.toByte()) // padding
+                val intf = supportedInterfaces[i]
+                buffer.put(intf.interfaceClass.toByte())
+                buffer.put(intf.interfaceSubclass.toByte())
+                buffer.put(intf.interfaceProtocol.toByte())
+                buffer.put(0.toByte()) 
             }
         }
 
+        // --- 2. WRITE SYNTHETIC DEVICE ---
+        if (isSyntheticInputActive) {
+            val startPos = buffer.position()
+            
+            val pathBytes = "/sys/devices/virtual/usbip/synthetic-1".toByteArray(Charsets.US_ASCII)
+            val pathBuffer = ByteArray(256)
+            System.arraycopy(pathBytes, 0, pathBuffer, 0, minOf(pathBytes.size, 256))
+            buffer.put(pathBuffer)
+
+            val busidBytes = "synthetic-1".toByteArray(Charsets.US_ASCII)
+            val busidBuffer = ByteArray(32)
+            System.arraycopy(busidBytes, 0, busidBuffer, 0, minOf(busidBytes.size, 32))
+            buffer.put(busidBuffer)
+
+            buffer.putInt(99) // busnum
+            buffer.putInt(1)  // devnum
+            buffer.putInt(2)  // speed (Full Speed)
+            buffer.putShort(0x1209.toShort()) // vid
+            buffer.putShort(0x0001.toShort()) // pid
+            buffer.putShort(0x0100.toShort()) // bcdDevice
+
+            buffer.put(0.toByte()) // bDeviceClass
+            buffer.put(0.toByte()) // bDeviceSubClass
+            buffer.put(0.toByte()) // bDeviceProtocol
+            buffer.put(1.toByte()) // bConfigurationValue
+            buffer.put(1.toByte()) // bNumConfigurations
+            buffer.put(1.toByte()) // bNumInterfaces
+
+            // Interface 0 (HID)
+            buffer.put(3.toByte()) // bInterfaceClass (HID)
+            buffer.put(0.toByte()) // bInterfaceSubClass
+            buffer.put(0.toByte()) // bInterfaceProtocol
+            buffer.put(0.toByte()) // padding
+        }
+
         buffer.flip()
-        Log.i("UsbServerService", "Generated dynamic direct Device List payload (${buffer.remaining()} bytes) for ${exported.size} device(s)")
+        Log.i("UsbServerService", "Generated direct Device List payload. Physical: ${exported.size}, Synthetic: $isSyntheticInputActive")
         return buffer
     }
 
@@ -880,6 +918,7 @@ class UsbServerService : Service() {
         wifiLock = null
 
         stopNativeServer()
+        SyntheticInputJni.destroyRingBuffer()
         usbipNsdManager.unregisterService()
         telemetryServer.stop()
         openedDevices.values.forEach { it.connection.close() }
@@ -922,6 +961,7 @@ class UsbServerService : Service() {
     external fun getTelemetryJson(): String
 
     companion object {
+        var isSyntheticInputActive = false
         private const val CHANNEL_ID = "UsbServerChannel"
         private const val NOTIFICATION_ID = 1
         private const val ACTION_USB_PERMISSION_SERVICE = "com.mizukos.usbip.USB_PERMISSION_SERVICE"

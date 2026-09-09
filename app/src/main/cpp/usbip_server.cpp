@@ -29,6 +29,7 @@
 #include <numeric>
 #include <cmath>
 #include <pthread.h>
+#include "SyntheticUrbHandler.h"
 
 #define LOG_TAG "usbip_server"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -193,6 +194,15 @@ uint64_t calculate_jitter(const std::deque<uint64_t>& samples) {
     double variance = sq_sum / samples.size();
     return (uint64_t)(std::sqrt(variance) + 0.5);
 }
+
+// -----------------------------------------------------------------------------
+// Synthetic Input Buffer Implementation is handled in SyntheticInputJni.cpp
+// We declare the global pointer here for network thread access.
+// -----------------------------------------------------------------------------
+#include "SPSCRingBuffer.h"
+
+extern SPSCRingBuffer* g_EventBuffer;
+// -----------------------------------------------------------------------------
 
 static JavaVM* g_jvm = nullptr;
 static jobject g_service_obj = nullptr;
@@ -477,7 +487,7 @@ void tcp_tx_thread(std::shared_ptr<session_context> ctx) {
         tx_packet* pkt = nullptr;
         {
             std::unique_lock<std::mutex> lock(ctx->tx_mutex);
-            ctx->tx_cv.wait_for(lock, std::chrono::milliseconds(100), [&]{
+            ctx->tx_cv.wait_for(lock, std::chrono::milliseconds(5), [&]{
                 return !ctx->tx_queue.empty() || !ctx->is_connected->load();
             });
             if (!ctx->tx_queue.empty()) {
@@ -509,6 +519,26 @@ void tcp_tx_thread(std::shared_ptr<session_context> ctx) {
                 ctx->is_connected->store(false);
             }
             delete pkt;
+        }
+
+        // 2. Poll and Dispatch Synthetic Engine Events
+        SyntheticUrbResponse synResp = PollSyntheticEvents();
+        if (synResp.hasData) {
+            struct usbip_ret_submit ret = {0};
+            ret.command = htonl(USBIP_RET_SUBMIT);
+            ret.seqnum = synResp.seqnum;
+            ret.devid = 0;
+            ret.direction = htonl(1);              // 1 = IN Endpoint
+            ret.ep = htonl(synResp.ep);            // Convert host '1' to network byte order
+            ret.status = htonl(synResp.status);
+            ret.actual_length = htonl(synResp.payloadLen);
+
+            bool ok = send_iovec_all(ctx->client_fd, &ret, sizeof(ret),
+                                     synResp.payloadLen > 0 ? synResp.payload : nullptr,
+                                     synResp.payloadLen, 5000);
+            if (!ok) {
+                ctx->is_connected->store(false);
+            }
         }
     }
 
@@ -1141,19 +1171,23 @@ void handle_client(int client_fd, int device_fd) {
         }
         std::string busid(busid_buf, strnlen(busid_buf, 32));
 
-        // UDP flag polling removed. Direct TCP resolution.
-        int resolved_fd = get_int_for_busid(g_mid_getFd, busid);
-        if (resolved_fd == -1) {
-            struct op_common err_header = {0};
-            err_header.version = htons(USBIP_VERSION);
-            err_header.code = htons(OP_REP_IMPORT);
-            err_header.status = htonl(1);
-            send_all(client_fd, &err_header, sizeof(err_header));
-            is_connected->store(false);
-            notify_performance_locks(false);
-            return;
+        // FIX: Bypass physical FD checks for the virtual synthetic device and force device_fd = -1
+        if (busid == "synthetic-1") {
+            device_fd = -1; // CRITICAL: Sever connection to physical FD
+        } else {
+            int resolved_fd = get_int_for_busid(g_mid_getFd, busid);
+            if (resolved_fd == -1) {
+                struct op_common err_header = {0};
+                err_header.version = htons(USBIP_VERSION);
+                err_header.code = htons(OP_REP_IMPORT);
+                err_header.status = htonl(1);
+                send_all(client_fd, &err_header, sizeof(err_header));
+                is_connected->store(false);
+                notify_performance_locks(false);
+                return;
+            }
+            device_fd = resolved_fd;
         }
-        device_fd = resolved_fd;
         current_busid = busid;
         {
             std::lock_guard<std::mutex> lock(g_client_map_mutex);
@@ -1163,7 +1197,40 @@ void handle_client(int client_fd, int device_fd) {
         struct usbip_usb_device dev = {0};
         std::vector<struct usbip_usb_interface> intfs;
         std::vector<endpoint_info> eps;
-        get_device_info(device_fd, &dev, &intfs, &eps, busid.c_str());
+
+        if (current_busid == "synthetic-1") {
+            ResetSyntheticState(); // Ensure sticky keys are cleared on import
+            // Serve synthetic hardware attributes
+            std::memset(&dev, 0, sizeof(dev));
+            std::snprintf(dev.path, sizeof(dev.path), "/sys/devices/virtual/usbip/%s", current_busid.c_str());
+            std::strncpy(dev.busid, current_busid.c_str(), sizeof(dev.busid) - 1);
+            dev.busnum = htonl(99);
+            dev.devnum = htonl(1);
+            dev.speed = htonl(2); // USB_SPEED_FULL
+            dev.idVendor = htons(0x1209);
+            dev.idProduct = htons(0x0001);
+            dev.bcdDevice = htons(0x0100);
+            dev.bDeviceClass = 0;
+            dev.bDeviceSubClass = 0;
+            dev.bDeviceProtocol = 0;
+            dev.bConfigurationValue = 1;
+            dev.bNumConfigurations = 1;
+            dev.bNumInterfaces = 1;
+
+            struct usbip_usb_interface i = {0};
+            i.bInterfaceClass = 0x03; // HID
+            i.bInterfaceSubClass = 0x00;
+            i.bInterfaceProtocol = 0x00;
+            intfs.push_back(i);
+
+            endpoint_info info_item = {0};
+            info_item.addr = 0x81;
+            info_item.type = 0x03; // Interrupt
+            info_item.max_packet_size = 64;
+            eps.push_back(info_item);
+        } else {
+            get_device_info(device_fd, &dev, &intfs, &eps, busid.c_str());
+        }
 
         struct op_common reply_header = {0};
         reply_header.version = htons(USBIP_VERSION);
@@ -1173,25 +1240,30 @@ void handle_client(int client_fd, int device_fd) {
         send_all(client_fd, &reply_header, sizeof(reply_header));
         send_all(client_fd, &dev, sizeof(dev));
 
-        std::thread(reap_thread, current_busid, device_fd, session).detach();
+        // FIX: Do not launch the physical USB hardware reaper for the synthetic virtual device
+        if (current_busid != "synthetic-1") {
+            std::thread(reap_thread, current_busid, device_fd, session).detach();
+        }
 
-        for (int i = 0; i < 16; i++) {
-            struct usbdevfs_getdriver get_driver = {0};
-            get_driver.interface = i;
+        if (current_busid != "synthetic-1") {
+            for (int i = 0; i < 16; i++) {
+                struct usbdevfs_getdriver get_driver = {0};
+                get_driver.interface = i;
 
-            if (ioctl(device_fd, USBDEVFS_GETDRIVER, &get_driver) == 0) {
-                LOGI("Interface %d has active driver: %s. Detaching...", i, get_driver.driver);
-                struct usbdevfs_ioctl disconnect = {0};
-                disconnect.ifno = i;
-                disconnect.ioctl_code = USBDEVFS_DISCONNECT;
-                if (ioctl(device_fd, USBDEVFS_IOCTL, &disconnect) < 0) {
-                    LOGE("Failed to detach kernel driver on interface %d: %s", i, strerror(errno));
+                if (ioctl(device_fd, USBDEVFS_GETDRIVER, &get_driver) == 0) {
+                    LOGI("Interface %d has active driver: %s. Detaching...", i, get_driver.driver);
+                    struct usbdevfs_ioctl disconnect = {0};
+                    disconnect.ifno = i;
+                    disconnect.ioctl_code = USBDEVFS_DISCONNECT;
+                    if (ioctl(device_fd, USBDEVFS_IOCTL, &disconnect) < 0) {
+                        LOGE("Failed to detach kernel driver on interface %d: %s", i, strerror(errno));
+                    }
                 }
-            }
 
-            int intf = i;
-            if (ioctl(device_fd, USBDEVFS_CLAIMINTERFACE, &intf) == 0) {
-                LOGI("Successfully claimed interface %d", i);
+                int intf = i;
+                if (ioctl(device_fd, USBDEVFS_CLAIMINTERFACE, &intf) == 0) {
+                    LOGI("Successfully claimed interface %d", i);
+                }
             }
         }
 
@@ -1243,6 +1315,38 @@ void handle_client(int client_fd, int device_fd) {
                 req->busid = current_busid;
                 req->ctx = ctx;
                 ctx->req = req;
+
+                if (current_busid == "synthetic-1") {
+                    // Pass cmd_header.seqnum directly (retaining network byte order)
+                    SyntheticUrbResponse synResp = HandleSyntheticSubmit(cmd_header.seqnum, ep, dir, cmd_header.setup);
+
+                    if (synResp.hasData) {
+                        struct usbip_ret_submit ret = {0};
+                        ret.command = htonl(USBIP_RET_SUBMIT);
+                        ret.seqnum = synResp.seqnum; // Correctly retains network order from cmd_header.seqnum
+                        ret.devid = cmd_header.devid;
+                        ret.direction = cmd_header.direction;
+                        ret.ep = cmd_header.ep;
+                        ret.status = htonl(synResp.status);
+                        ret.actual_length = htonl(synResp.payloadLen);
+                        ret.number_of_packets = htonl(0xFFFFFFFF);
+
+                        tx_packet* pkt = new tx_packet();
+                        pkt->header = ret;
+                        if (synResp.payloadLen > 0) {
+                            pkt->payload = new uint8_t[synResp.payloadLen];
+                            std::memcpy(pkt->payload, synResp.payload, synResp.payloadLen);
+                            pkt->payload_len = synResp.payloadLen;
+                        }
+                        session->enqueue_response(pkt);
+                        LOGI("<<< SYNTHETIC RET_SUBMIT (EP%u): seq=%u, status=%d, len=%u",
+                             ep, ntohl(synResp.seqnum), synResp.status, synResp.payloadLen);
+                    }
+
+                    delete req;
+                    delete ctx;
+                    continue;
+                }
 
                 {
                     std::lock_guard<std::mutex> lock(session->request_mutex);
@@ -1310,16 +1414,34 @@ void handle_client(int client_fd, int device_fd) {
 
                     if (cmd_header.setup[0] == 0x00 && bRequest == 0x09) {
                         int config = wValue & 0xFF;
-                        LOGI("TCP: Executing SET_CONFIGURATION (config=%d)", config);
+                        LOGI("TCP: Intercepted SET_CONFIGURATION (config=%d)", config);
 
-                        int res_sc = ioctl(device_fd, USBDEVFS_SETCONFIGURATION, &config);
-                        if (res_sc < 0) {
-                            LOGW("USBDEVFS_SETCONFIGURATION failed: %s (errno=%d)", strerror(errno), errno);
+                        int status = 0;
+
+                        // Standard USB devices operate on config 1. The physical hardware is already
+                        // set to config 1 by the Android kernel upon connection.
+                        if (config != 1 && config != 0) {
+                            // Release interfaces before attempting a genuine configuration switch
+                            for (int i = 0; i < 16; i++) {
+                                int intf = i;
+                                ioctl(device_fd, USBDEVFS_RELEASEINTERFACE, &intf);
+                            }
+
+                            int res_sc = ioctl(device_fd, USBDEVFS_SETCONFIGURATION, &config);
+                            if (res_sc < 0) {
+                                int saved_errno = errno;
+                                LOGW("USBDEVFS_SETCONFIGURATION failed: %s (errno=%d)", strerror(saved_errno), saved_errno);
+                                if (saved_errno != EBUSY) {
+                                    status = -saved_errno;
+                                }
+                            } else {
+                                LOGI("USBDEVFS_SETCONFIGURATION succeeded for config %d", config);
+                            }
                         } else {
-                            LOGI("USBDEVFS_SETCONFIGURATION succeeded for config %d", config);
+                            LOGI("Device already in default configuration %d; short-circuiting to success.", config);
                         }
 
-                        // Re-detach active drivers and re-claim interfaces after setting configuration
+                        // Ensure kernel drivers remain detached and interfaces claimed
                         for (int i = 0; i < 16; i++) {
                             struct usbdevfs_getdriver get_driver = {0};
                             get_driver.interface = i;
@@ -1331,7 +1453,7 @@ void handle_client(int client_fd, int device_fd) {
                             }
                             int intf = i;
                             if (ioctl(device_fd, USBDEVFS_CLAIMINTERFACE, &intf) == 0) {
-                                LOGI("Re-claimed interface %d after SET_CONFIGURATION", i);
+                                LOGI("Re-claimed interface %d", i);
                             }
                         }
 
@@ -1347,7 +1469,8 @@ void handle_client(int client_fd, int device_fd) {
                         ret.devid = ctx->devid;
                         ret.direction = ctx->direction;
                         ret.ep = ctx->ep;
-                        ret.status = (res_sc < 0 && errno != EBUSY) ? htonl((uint32_t)-errno) : 0;
+                        ret.status = (status < 0) ? htonl((uint32_t)status) : 0;
+                        ret.actual_length = 0;
 
                         tx_packet* pkt = new tx_packet();
                         pkt->header = ret;
@@ -1432,6 +1555,10 @@ void handle_client(int client_fd, int device_fd) {
                         delete ctx;
                         continue;
                     }
+                }
+
+                if (current_busid == "synthetic-1") {
+                    continue; // Physical URB submission is skipped for synthetic connections
                 }
 
                 {

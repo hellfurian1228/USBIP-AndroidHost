@@ -7,6 +7,7 @@ import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -36,6 +37,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var usbManager: UsbManager
     private lateinit var viewModel: UsbDeviceViewModel
     private lateinit var deviceAdapter: DeviceAdapter
+    private lateinit var fallbackManager: SyntheticFallbackManager
 
     private lateinit var tvServerIp: TextView
     private lateinit var tvAllNetworks: TextView
@@ -69,8 +71,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         
         // Keep screen on while app is in foreground
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -84,13 +86,6 @@ class MainActivity : ComponentActivity() {
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             v.setPadding(v.paddingLeft, systemBars.top, v.paddingRight, systemBars.bottom)
             insets
-        }
-
-        // Global error catching
-        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            ErrorLogger.log("FATAL EXCEPTION: ${throwable.message}", throwable)
-            defaultHandler?.uncaughtException(thread, throwable)
         }
 
         initViews()
@@ -121,8 +116,49 @@ class MainActivity : ComponentActivity() {
         rvDevices = findViewById(R.id.rv_devices)
         tvEmptyState = findViewById(R.id.tv_empty_state)
         val btnViewLogs: Button = findViewById(R.id.btn_view_logs)
+        val btnTestInput: Button = findViewById(R.id.btn_test_input)
         btnRefresh = findViewById(R.id.btn_refresh)
         val statusCard: MaterialCardView = findViewById(R.id.status_card)
+        val switchSyntheticInput: com.google.android.material.switchmaterial.SwitchMaterial = findViewById(R.id.switch_synthetic_input)
+
+        // --- SYNTHETIC INPUT INITIALIZATION ---
+        // 1. Allocate native memory for the Lock-Free SPSC queue
+        SyntheticInputJni.initRingBuffer(1024)
+        
+        // 2. Initialize Fallback Manager
+        fallbackManager = SyntheticFallbackManager(this, ErrorLogger)
+        
+        val rootView = findViewById<View>(R.id.main_root)
+
+        // Test Input Button handler
+        btnTestInput.setOnClickListener {
+            // Instantly send a relative mouse movement (dx = 50, dy = 50)
+            SyntheticInputJni.pushMouseEvent(0, 50f, 50f, 0f)
+
+            // Simulate pressing and releasing the 'A' key (Android keycode 29)
+            SyntheticInputJni.pushKeyboardEvent(29, true)  // Key down
+            SyntheticInputJni.pushKeyboardEvent(29, false) // Key up
+
+            Toast.makeText(this, "Sent test synthetic input events", Toast.LENGTH_SHORT).show()
+        }
+
+        // Handle manual UI toggle switch
+        switchSyntheticInput.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.enableSyntheticDevice(isChecked)
+            if (isChecked) {
+                fallbackManager.attachSyntheticEngine(rootView)
+            } else {
+                fallbackManager.detachSyntheticEngine(rootView)
+            }
+        }
+
+        // 3. Evaluate intercept status after UI is fully laid out (auto-enable switch if fallback detected)
+        rootView.post {
+            if (fallbackManager.evaluateSilentFallback(rootView)) {
+                switchSyntheticInput.isChecked = true
+            }
+        }
+        // --------------------------------------
 
         btnRefresh.setOnClickListener {
             lifecycleScope.launch { viewModel.refreshDevices() }
@@ -136,6 +172,28 @@ class MainActivity : ComponentActivity() {
             showIpSelectionDialog()
         }
     }
+
+    // --- GLOBAL KEYBOARD INTERCEPTOR ---
+    @Suppress("RestrictedApi")
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (UsbServerService.isSyntheticInputActive) {
+            // Allow system keys to bypass so the user isn't trapped
+            if (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP || 
+                event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || 
+                event.keyCode == KeyEvent.KEYCODE_POWER ||
+                event.keyCode == KeyEvent.KEYCODE_BACK) {
+                return super.dispatchKeyEvent(event)
+            }
+
+            val isDown = event.action == KeyEvent.ACTION_DOWN
+            if (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP) {
+                SyntheticInputJni.pushKeyboardEvent(event.keyCode, isDown)
+                return true // Consume event so Android UI doesn't react
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+    // -----------------------------------
 
     private fun showDebugLogsDialog() {
         val logs = ErrorLogger.getLogs()

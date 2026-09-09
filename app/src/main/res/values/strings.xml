@@ -19,4 +19,7 @@
     <string name="requesting_permission_msg">Requesting permission for %1$s</string>
     <string name="permission_granted_msg">Permission GRANTED for %1$s</string>
     <string name="permission_denied_msg">Permission DENIED for %1$s</string>
+    <string name="virtual_input_title">Virtual Input Forwarding</string>
+    <string name="virtual_input_desc">Advertise synthetic keyboard &amp; mouse (synthetic-1) over USB/IP</string>
+    <string name="support_message">For support, you can contact me at:\nEmail: pasghettios@proton.me\nUSBIP Discord: https://discord.gg/PSnsk4xMHW</string>
 </resources>
