@@ -1,0 +1,25 @@
+{
+  "servers": {
+    "io.github.github/github-mcp-server": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "requestInit": {
+        "headers": {
+          "Authorization": ""
+        }
+      },
+      "x-metadata": {
+        "registry": {
+          "api": {
+            "baseUrl": "https://api.mcp.github.com",
+            "version": "v0.1"
+          },
+          "mcpServer": {
+            "name": "io.github.github/github-mcp-server",
+            "version": "1.12.0"
+          }
+        }
+      }
+    }
+  }
+}
