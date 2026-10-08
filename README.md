@@ -14,9 +14,9 @@ A streamlined Android implementation of the **USB/IP** protocol. This app transf
 Most USB/IP solutions require complex Linux setups or rooted devices. This project aims to make the process accessible through a standard Android app, specifically tuned for low-latency peripherals like sim-racing gear.
 
 ## 📢 Project Update: The Future of USBIP-AndroidHost
-This repository represents the final free, open-source version of USBIP-AndroidHost.
+This repository represents the final free version of USBIP-AndroidHost.
 
-When I started this project, I stated that it would be a free solution, and I am honoring that promise. This existing open-source repository will always remain free and available to you here on GitHub.
+When I started this project, I stated that it would be a free solution, and I am honoring that promise. This will always remain free and available to you here on GitHub.
 
 I want to extend a massive thank you to everyone who has helped with testing, reporting bugs, and ensuring we could build a stable, functional, and truly free alternative to the other paid app out there (you know the one) with its predatory, hardware-locked licensing!
 
